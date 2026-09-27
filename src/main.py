@@ -12,9 +12,14 @@ import sys
 from src.observability import (
     configure_observability,
     get_logger,
-    shutdown_observability,
 )
-from src.settings import load_settings
+
+# Conditional import: shutdown_observability is optional — if the observability
+# module is a stripped-down build (e.g. embedded deployment), we still start.
+try:
+    from src.observability import shutdown_observability
+except ImportError:
+    shutdown_observability = None  # type: ignore[assignment]
 
 logger = get_logger(__name__)
 
@@ -57,12 +62,12 @@ def main() -> int:
         server_logger.exception("server_failed_to_start", error=str(exc))
         return 4
     finally:
-        try:
-            shutdown_observability()
-        except Exception as exc:
-            print(f"[WARN] observability shutdown failed: {exc}", file=sys.stderr)
+        if shutdown_observability is not None:
+            try:
+                shutdown_observability()
+            except Exception as exc:
+                print(f"[WARN] observability shutdown failed: {exc}", file=sys.stderr)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

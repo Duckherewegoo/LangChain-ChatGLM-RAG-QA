@@ -166,3 +166,48 @@ def metrics_context() -> Iterator[None]:
     """Yield once while exporting metrics availability for testing."""
 
     yield None
+
+def shutdown_observability() -> None:
+
+    """
+    Tear down observability resources.
+
+    Currently resets the module-level Prometheus collectors so a subsequent
+    call to ``configure_observability`` re-registers them cleanly. This matters
+    in tests where the module is re-imported and collector names would collide,
+    and also on process shutdown where we want a deterministic flush point.
+
+    The function is safe to call multiple times and safe to call when metrics
+    were never initialized (Prometheus absent or ``metrics_enabled=False``).
+    """
+
+    global REQUESTS_TOTAL, REQUEST_LATENCY, RETRIEVAL_DOCUMENTS, TOOL_CALLS_TOTAL
+    global INGESTED_CHUNKS, RERANK_LATENCY
+
+    if _PROMETHEUS_AVAILABLE:
+        try:
+            from prometheus_client import REGISTRY
+
+            for collector in (
+                REQUESTS_TOTAL,
+                REQUEST_LATENCY,
+                RETRIEVAL_DOCUMENTS,
+                TOOL_CALLS_TOTAL,
+                INGESTED_CHUNKS,
+                RERANK_LATENCY,
+            ):
+                if collector is not None:
+                    REGISTRY.unregister(collector)
+        except KeyError:
+            # Collector was already removed (e.g. test re-init). Not an error.
+            pass
+
+    REQUESTS_TOTAL = None
+    REQUEST_LATENCY = None
+    RETRIEVAL_DOCUMENTS = None
+    TOOL_CALLS_TOTAL = None
+    INGESTED_CHUNKS = None
+    RERANK_LATENCY = None
+
+    _REQUEST_ID.set("")
+    _START_TIME.set(0.0)
