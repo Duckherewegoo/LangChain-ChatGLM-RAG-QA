@@ -8,7 +8,8 @@ application never crashes silently before binding a port.
 from __future__ import annotations
 
 import sys
-
+from src.settings.settings import *
+from src.settings.settings import load_settings
 from src.observability import (
     configure_observability,
     get_logger,
