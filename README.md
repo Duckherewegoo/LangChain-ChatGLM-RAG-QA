@@ -214,4 +214,4 @@ enterprise-rag-chatglm/
 
 ## License
 
-MIT
+GPL-3.0
