@@ -1,0 +1,62 @@
+# Production-oriented settings. Secrets should still be supplied through environment
+# variables or a secrets manager; values here only document expected keys.
+
+app:
+  name: enterprise-rag-chatglm
+  env: development
+  host: 0.0.0.0
+  port: 8000
+
+model:
+  chat:
+    provider: zhipu
+    model_name: glm-5.2
+    temperature: 0.2
+    max_tokens: 2048
+    timeout_seconds: 45
+    max_retries: 2
+    base_url: https://open.bigmodel.cn/api/paas/v4/
+  embedding:
+    model_name: BAAI/bge-small-zh-v1.5
+    device: cpu
+    batch_size: 32
+
+ingest:
+  supported_extensions:
+    - .txt
+    - .md
+    - .pdf
+    - .docx
+  chunk_size: 600
+  chunk_overlap: 100
+  min_characters: 50
+
+retrieval:
+  vector_store:
+    type: chromadb
+    collection: enterprise_knowledge
+    persist_directory: ./data/index
+  top_k: 8
+  fetch_multiplier: 3
+  rerank:
+    enabled: true
+    model_name: BAAI/bge-reranker-v2-m3
+    top_k: 4
+    min_score: 0.05
+
+agent:
+  max_iterations: 6
+  max_tool_calls: 8
+  allowed_tools:
+    - retrieve_knowledge
+    - list_sources
+    - summarize_citations
+
+security:
+  max_question_length: 2000
+  max_history_messages: 12
+  prompt_injection_action: reject
+
+observability:
+  tracing_enabled: false
+  metrics_enabled: true
