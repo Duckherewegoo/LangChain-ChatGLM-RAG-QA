@@ -1,8 +1,7 @@
 """Embedding abstraction and default local implementation.
 
-Embedding models are pluggable. Because changing the embedding model changes
-vector geometry, :class:`EmbeddingModel` exposes a stable ``dimension`` so that
-persistent indexes can reject mismatched collections before attempting search.
+定义 Embedding 模型协议接口与默认的本地 Sentence-Transformers 实现。
+业务层通过该模块定义的接口进行操作，隔离具体的底层实现。
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ import typing
 
 from pydantic import BaseModel
 
-if typing.TYPE_CHECKING:  # pragma: no cover - type checking only
+if typing.TYPE_CHECKING:  # 仅用于类型检查
     from collections.abc import Sequence
 
     from sentence_transformers import SentenceTransformer
@@ -23,36 +22,47 @@ if typing.TYPE_CHECKING:  # pragma: no cover - type checking only
 _E5_QUERY_INSTRUCTION = "query: "
 
 
-class EmbeddingModel:
-    """Embedding provider protocol."""
+@typing.runtime_checkable
+class EmbeddingModel(typing.Protocol):
+    """Embedding 模型协议接口。
 
-    name: str = "base"
-    dimension: int = 0
+    具体实现类不需要显式继承本类，只要实现了以下属性和方法即可。
+    """
+
+    name: str
+    model_name: str
+    dimension: int
+    normalize: bool
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
-        """Encode document texts into embedding vectors."""
-
-        raise NotImplementedError
+        """将文档文本转换为向量表示。"""
+        ...
 
     def embed_query(self, text: str) -> list[float]:
-        """Encode a search query."""
+        """将搜索查询转换为向量表示。"""
+        ...
 
-        raise NotImplementedError
 
+class _LocalEmbeddingModel:
+    """基于 Sentence-Transformers 的本地 Embedding 实现。
 
-class _LocalEmbeddingModel(EmbeddingModel):
-    """Sentence-Transformers-backed embedding model.
-
-    It lazily loads the underlying model, normalizes empty or malformed input,
-    and adds the E5 query instruction when the selected model expects it.
+    特性：
+    1. 懒加载底层模型。
+    2. 自动清理空白字符与畸形输入。
+    3. 为 E5 系列模型自动添加查询前缀。
     """
 
     def __init__(self, settings: ModelEmbeddingSettings) -> None:
+        self.name = "local"
         self._settings = settings
+        self.model_name = settings.model_name
         self._model: SentenceTransformer | None = None
         self._lock = threading.Lock()
+        self.dimension = 0
+        self.normalize = settings.normalize
 
     def _load(self) -> SentenceTransformer:
+        """线程安全的懒加载机制。"""
         if self._model is not None:
             return self._model
 
@@ -67,6 +77,7 @@ class _LocalEmbeddingModel(EmbeddingModel):
         return self._model
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        """批量处理文档向量化。"""
         prepared = [_normalize_text(text) for text in texts]
         if not prepared:
             return []
@@ -82,9 +93,10 @@ class _LocalEmbeddingModel(EmbeddingModel):
         return [list(map(float, row)) for row in vectors]
 
     def embed_query(self, text: str) -> list[float]:
+        """处理查询向量化，兼容 E5 模型前缀。"""
         cleaned = _normalize_text(text)
         if not cleaned:
-            raise ValueError("Cannot embed an empty query.")
+            raise ValueError("不能对空查询进行向量化处理。")
 
         model = self._load()
         instruction = _E5_QUERY_INSTRUCTION if _is_e5_model(self._settings.model_name) else ""
@@ -110,16 +122,14 @@ def _is_e5_model(name: str) -> bool:
 
 
 def create_embedding_model(settings: ModelEmbeddingSettings) -> EmbeddingModel:
-    """Create the configured local embedding model."""
-
+    """根据配置创建 Embedding 模型实例。"""
     model = _LocalEmbeddingModel(settings)
-    model._load()  # noqa: SLF001 - eager validation at construction time
+    # 移除强制加载，尊重懒加载机制。如果需要校验，应在调用方按需触发。
     return model
 
 
 class EmbedderHealth(BaseModel):
-    """Embedding provider health summary."""
-
+    """Embedding 提供者的健康状态摘要。"""
     provider: str = "local"
     model_name: str
     model_loaded: bool = False
@@ -127,19 +137,16 @@ class EmbedderHealth(BaseModel):
 
 
 def describe_embedding_health(embedder: EmbeddingModel) -> EmbedderHealth:
-    """Return a safe health summary for an embedder."""
-
-    model_name = getattr(getattr(embedder, "_settings", None), "model_name", "unknown")
+    """返回安全的 Embedding 健康状态摘要。"""
     return EmbedderHealth(
-        model_name=model_name,
+        model_name=embedder.model_name,
         model_loaded=embedder.dimension > 0,
         dimension=embedder.dimension,
     )
 
 
 def stable_hash(text: str, namespace: str = "chunk") -> str:
-    """Create a stable SHA-256 derived identifier for deduplication."""
-
+    """生成基于 SHA-256 的稳定标识符，用于去重。"""
     digest = hashlib.sha256()
     digest.update(namespace.encode("utf-8"))
     digest.update(b"\x00")

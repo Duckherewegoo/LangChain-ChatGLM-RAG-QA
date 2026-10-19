@@ -1,58 +1,136 @@
-"""Chat and embedding model abstractions, providers, routing, and fallback."""
+"""对话与嵌入模型的抽象层、提供者、路由与回退机制。
 
-from src.model.embedding import (
-    EmbedderHealth,
-    EmbeddingModel,
-    create_embedding_model,
-    describe_embedding_health,
-    stable_hash,
-)
-from src.model.errors import (
-    ClassifiedError,
-    ModelAPIConnectionError,
-    ModelAuthenticationError,
-    ModelConfigurationError,
-    ModelContentPolicyError,
-    ModelPayloadError,
-    ModelRateLimitError,
-    ModelTimeoutError,
-    classify_model_error,
-    is_retryable,
-)
-from src.model.fallback import FallbackAttempt, FallbackExecutor, FallbackResult
-from src.model.health import (
-    HealthReport,
-    ProviderHealth,
-    check_chain,
-    check_provider,
-    select_provider,
-)
-from src.model.manager import (
-    ChatModel,
-    ChatRequest,
-    ChatResponse,
-    ProviderFactory,
-    create_chat_model,
-)
-from src.model.registry import (
-    available_providers,
-    clear_registry,
-    is_registered,
-    register_alias,
-    register_provider,
-    resolve_factory,
-)
-from src.model.router import (
-    ModelRoute,
-    ModelRouter,
-    select_fallback_chain,
-)
-from src.model.routing_types import (
-    ModelCapabilitySettings,
-    ModelRouterSettings,
-    ModelRoutingEntry,
-    UseCaseBinding,
-)
+本模块作为模型层的统一外观（Facade），按需导出内部子模块的公共接口。
+"""
+
+import typing
+
+if typing.TYPE_CHECKING:
+    from src.model.embedding import (
+        EmbedderHealth,
+        EmbeddingModel,
+        create_embedding_model,
+        describe_embedding_health,
+        stable_hash,
+    )
+    from src.model.errors import (
+        ClassifiedError,
+        ModelAPIConnectionError,
+        ModelAuthenticationError,
+        ModelConfigurationError,
+        ModelContentPolicyError,
+        ModelPayloadError,
+        ModelRateLimitError,
+        ModelTimeoutError,
+        classify_model_error,
+        is_retryable,
+    )
+    from src.model.fallback import FallbackAttempt, FallbackExecutor, FallbackResult
+    from src.model.health import (
+        HealthReport,
+        ProviderHealth,
+        check_chain,
+        check_provider,
+        select_provider,
+    )
+    from src.model.manager import (
+        ProviderFactory,
+        create_chat_model,
+    )
+    from src.model.protocol import (
+        ChatModel,
+        ChatRequest,
+        ChatResponse,
+    )
+    from src.model.registry import (
+        available_providers,
+        clear_registry,
+        is_registered,
+        register_alias,
+        register_provider,
+        resolve_factory,
+    )
+    from src.model.router import (
+        ModelRoute,
+        ModelRouter,
+        select_fallback_chain,
+    )
+    from src.model.routing_types import (
+        ModelCapabilitySettings,
+        ModelRouterSettings,
+        ModelRoutingEntry,
+        UseCaseBinding,
+    )
+
+
+def __getattr__(name: str) -> typing.Any:
+    """PEP 562 惰性加载实现。
+    
+    防止在仅仅导入 src.model 时触发整个模型层及重型依赖的全量加载，
+    同时避免潜在的循环导入死锁。
+    """
+    if name in ("ChatModel", "ChatRequest", "ChatResponse"):
+        from src.model.protocol import ChatModel, ChatRequest, ChatResponse
+        return locals()[name]
+
+    if name in ("ProviderFactory", "create_chat_model"):
+        from src.model.manager import ProviderFactory, create_chat_model
+        return locals()[name]
+
+    if name in ("EmbedderHealth", "EmbeddingModel", "create_embedding_model", "describe_embedding_health", "stable_hash"):
+        from src.model.embedding import (
+            EmbedderHealth,
+            EmbeddingModel,
+            create_embedding_model,
+            describe_embedding_health,
+            stable_hash,
+        )
+        return locals()[name]
+
+    if name in ("ClassifiedError", "ModelAPIConnectionError", "ModelAuthenticationError", "ModelConfigurationError", "ModelContentPolicyError", "ModelPayloadError", "ModelRateLimitError", "ModelTimeoutError", "classify_model_error", "is_retryable"):
+        from src.model.errors import (
+            ClassifiedError,
+            ModelAPIConnectionError,
+            ModelAuthenticationError,
+            ModelConfigurationError,
+            ModelContentPolicyError,
+            ModelPayloadError,
+            ModelRateLimitError,
+            ModelTimeoutError,
+            classify_model_error,
+            is_retryable,
+        )
+        return locals()[name]
+
+    if name in ("FallbackAttempt", "FallbackExecutor", "FallbackResult"):
+        from src.model.fallback import FallbackAttempt, FallbackExecutor, FallbackResult
+        return locals()[name]
+
+    if name in ("HealthReport", "ProviderHealth", "check_chain", "check_provider", "select_provider"):
+        from src.model.health import HealthReport, ProviderHealth, check_chain, check_provider, select_provider
+        return locals()[name]
+
+    if name in ("available_providers", "clear_registry", "is_registered", "register_alias", "register_provider", "resolve_factory"):
+        from src.model.registry import (
+            available_providers,
+            clear_registry,
+            is_registered,
+            register_alias,
+            register_provider,
+            resolve_factory,
+        )
+        return locals()[name]
+
+    if name in ("ModelRoute", "ModelRouter", "select_fallback_chain"):
+        from src.model.router import ModelRoute, ModelRouter, select_fallback_chain
+        return locals()[name]
+
+    if name in ("ModelCapabilitySettings", "ModelRouterSettings", "ModelRoutingEntry", "UseCaseBinding"):
+        from src.model.routing_types import ModelCapabilitySettings, ModelRouterSettings, ModelRoutingEntry, UseCaseBinding
+        return locals()[name]
+
+    raise AttributeError(f"模块 {__name__!r} 没有属性 {name!r}")
+
 
 __all__ = [
     "ChatModel",

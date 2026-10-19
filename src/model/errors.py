@@ -1,8 +1,8 @@
-"""Model-layer exceptions and error classification.
+"""模型层异常与错误分类。
 
-Exceptions are intentionally narrow so that callers can distinguish
-configuration mistakes, client errors, rate limits, content policy rejections,
-and unrecoverable provider failures without parsing messages.
+异常被刻意设计为细粒度，使得调用方能够区分：
+配置错误、客户端错误、限流、内容策略拒绝、以及不可恢复的提供者故障，
+而无需解析错误消息字符串。
 """
 
 from __future__ import annotations
@@ -11,75 +11,54 @@ from pydantic import BaseModel
 
 from src.exceptions import ModelInvocationError, ModelNotConfiguredError
 
-_RETRYABLE_KEYWORDS = (
-    "timeout",
-    "timed out",
-    "connection",
-    "network",
-    "temporar",
-    "try again",
-    "503",
-    "502",
-    "504",
-    "internal server error",
-    "overloaded",
-    "capacity",
-    "econnreset",
-    "socket",
-)
-
+# ==================== 细粒度异常定义 ====================
 
 class ModelConfigurationError(ModelNotConfiguredError):
-    """Required model configuration is missing or inconsistent."""
-
+    """缺少必要的模型配置，或配置不一致。"""
     status_code = 500
     error_code = "model_configuration_error"
 
 
 class ModelAPIConnectionError(ModelInvocationError):
-    """Transport-level failure contacting the model provider."""
-
+    """与提供者建立传输层连接失败。"""
     status_code = 502
     error_code = "model_connection_error"
 
 
 class ModelTimeoutError(ModelInvocationError):
-    """The model provider did not respond within the configured timeout."""
-
+    """提供者在配置的超时时间内未响应。"""
     status_code = 504
     error_code = "model_timeout"
 
 
 class ModelRateLimitError(ModelInvocationError):
-    """The provider rejected the request due to quota or rate limiting."""
-
+    """提供者因配额或限流拒绝了请求。"""
     status_code = 429
     error_code = "model_rate_limited"
 
 
 class ModelAuthenticationError(ModelNotConfiguredError):
-    """API key or credential was rejected."""
-
+    """API Key 或凭证被拒绝。"""
     status_code = 401
     error_code = "model_authentication_error"
 
 
 class ModelContentPolicyError(ModelInvocationError):
-    """The provider blocked the request or response for policy reasons."""
-
+    """提供者出于内容策略原因阻断了请求或响应。"""
     status_code = 400
     error_code = "model_content_policy"
 
 
 class ModelPayloadError(ModelInvocationError):
-    """The request or response could not be interpreted."""
-
+    """请求或响应无法被解析。"""
     status_code = 400
     error_code = "model_payload_error"
 
 
+# ==================== 分类结果模型 ====================
+
 class ClassifiedError(BaseModel):
-    """Typed outcome of :func:`classify_model_error`."""
+    """classify_model_error 的类型化结果。"""
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -91,8 +70,7 @@ class ClassifiedError(BaseModel):
     status_code: int = 500
 
     def to_exception(self) -> Exception:
-        """Return an appropriate domain exception."""
-
+        """返回合适的领域异常。"""
         mapping = {
             "configuration": ModelConfigurationError,
             "authentication": ModelAuthenticationError,
@@ -101,60 +79,78 @@ class ClassifiedError(BaseModel):
             "rate_limit": ModelRateLimitError,
             "content_policy": ModelContentPolicyError,
             "payload": ModelPayloadError,
+            "unknown": ModelInvocationError,
         }
         exception_type = mapping.get(self.error_type, ModelInvocationError)
         return exception_type(self.message)
 
 
+# ==================== 关键词表 ====================
+
+_RETRYABLE_KEYWORDS = (
+    "timeout", "timed out", "connection", "network",
+    "temporar", "try again", "503", "502", "504",
+    "internal server error", "overloaded", "capacity",
+    "econnreset", "socket", "429", "rate limit",
+)
+
+# error_code -> 是否可重试的映射表。
+# 使用显式映射而非集合推导，避免新增异常时漏掉配置。
+_RETRYABLE_ERROR_CODES = frozenset({
+    "model_timeout",
+    "model_connection_error",
+    "model_rate_limited",
+})
+
+
+# ==================== 分类器 ====================
+
 def classify_model_error(
     exc: BaseException, *, provider: str | None = None
 ) -> ClassifiedError:
-    """Map a provider exception to a stable error category."""
+    """将提供者抛出的异常映射为稳定的错误类别。"""
 
     message = str(exc).strip()
     lowered = message.lower()
 
+    # 分支 1：配置类（不可重试）
     if isinstance(exc, ModelNotConfiguredError):
         return ClassifiedError(
             exception_type=type(exc).__name__,
             error_type="configuration",
-            message=message or "Model is not configured.",
+            message=message or "模型未配置。",
             retryable=False,
             provider=provider,
             status_code=exc.status_code,
         )
 
+    # 分支 2：认证类（不可重试）
     if isinstance(exc, ModelAuthenticationError):
         return ClassifiedError(
             exception_type=type(exc).__name__,
             error_type="authentication",
-            message=message or "Model authentication failed.",
+            message=message or "模型认证失败。",
             retryable=False,
             provider=provider,
             status_code=401,
         )
-    if isinstance(exc, ModelTimeoutError):
-        return ClassifiedError(
-            exception_type=type(exc).__name__,
-            error_type="timeout",
-            message=message or "Model request timed out.",
-            retryable=True,
-            provider=provider,
-            status_code=504,
-        )
+
+    # 分支 3：其他模型层异常（依赖 error_code 精确判断可重试性）
     if isinstance(exc, ModelInvocationError):
         category = exc.error_code
-        retryable = category in {"timeout", "connection", "rate_limit"}
+        # 使用显式映射表判断，避免漏判
+        retryable = category in _RETRYABLE_ERROR_CODES
         return ClassifiedError(
             exception_type=type(exc).__name__,
             error_type=category,
-            message=message or "Model invocation failed.",
+            message=message or "模型调用失败。",
             retryable=retryable,
             provider=provider,
             status_code=exc.status_code,
         )
 
-    if "authentication" in lowered or "unauthorized" in lowered or "401" in lowered or "invalid api key" in lowered:
+    # 分支 4：基于消息关键词的启发式分类
+    if "invalid api key" in lowered or "authentication" in lowered or "unauthorized" in lowered or "401" in lowered:
         return ClassifiedError(
             exception_type=type(exc).__name__,
             error_type="authentication",
@@ -171,15 +167,6 @@ def classify_model_error(
             retryable=True,
             provider=provider,
             status_code=429,
-        )
-    if "authentication" in lowered or "unauthorized" in lowered or "401" in lowered:
-        return ClassifiedError(
-            exception_type=type(exc).__name__,
-            error_type="authentication",
-            message=message,
-            retryable=False,
-            provider=provider,
-            status_code=401,
         )
     if "content policy" in lowered or "moderation" in lowered or ("400" in lowered and "content" in lowered):
         return ClassifiedError(
@@ -208,7 +195,7 @@ def classify_model_error(
             provider=provider,
             status_code=502,
         )
-    if any(keyword in lowered for keyword in _RETRYABLE_KEYWORDS):
+    if any(kw in lowered for kw in _RETRYABLE_KEYWORDS):
         return ClassifiedError(
             exception_type=type(exc).__name__,
             error_type="connection",
@@ -218,10 +205,11 @@ def classify_model_error(
             status_code=502,
         )
 
+    # 兜底：未知错误
     return ClassifiedError(
         exception_type=type(exc).__name__,
         error_type="unknown",
-        message=message or "Unknown model provider error.",
+        message=message or "未知的模型提供者错误。",
         retryable=False,
         provider=provider,
         status_code=500,
@@ -229,8 +217,7 @@ def classify_model_error(
 
 
 def is_retryable(exc: BaseException, *, provider: str | None = None) -> bool:
-    """Return True when the error is likely transient."""
-
+    """当错误是瞬时故障时返回 True。"""
     return classify_model_error(exc, provider=provider).retryable
 
 

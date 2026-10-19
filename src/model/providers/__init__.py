@@ -1,10 +1,10 @@
-"""Model provider implementations.
+"""模型提供者实现包。
 
-Importing this package registers all built-in providers. A provider is only
-registered after its module is imported, isolating optional SDK dependencies.
+导入此包将注册所有内置的模型提供者。
+一个提供者只有在其对应的模块被导入后才会被注册，以此隔离可选 SDK 的依赖。
 """
 
-from src.model.providers import (  # noqa: F401  - registration side effects
+from src.model.providers import (  # noqa: F401 - 仅用于触发注册副作用
     deepseek,
     doubao,
     openai_compatible,

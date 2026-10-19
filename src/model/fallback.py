@@ -1,71 +1,58 @@
-"""Model fallback execution.
+"""模型回退执行。
 
-This module implements a sequential fallback chain. It retries transient
-failures against the preferred model, then escalates to secondary providers.
-Permanent failures—such as authentication, content policy, and configuration
-errors—are not masked by retrying or failing over, because they would recur on
-every provider.
+本模块实现顺序回退链。对于首选模型的瞬时故障进行重试，
+随后升级至备用提供者。永久性故障（如认证、内容策略、配置错误）
+不会被掩盖，因为它们在所有提供者上都会重复发生。
 """
 
 from __future__ import annotations
 
+import time
 import typing
 
 from pydantic import BaseModel, Field
 
+from src.model.protocol import ChatModel, ChatRequest, ChatResponse
 from src.observability import get_logger
 
-if typing.TYPE_CHECKING:  # pragma: no cover - type checking only
+if typing.TYPE_CHECKING:  # 仅用于类型检查
     from collections.abc import Iterable
-
-    from src.model.manager import ChatModel, ChatRequest, ChatResponse
-
-
-def _resolve_chat_response() -> type:
-    """Resolve ChatResponse at runtime to avoid circular import with manager."""
-    from src.model.manager import ChatResponse
-
-    return ChatResponse
-
-
-# Use a string forward reference; Pydantic resolves it after manager is loaded.
-ChatResponseRef = "ChatResponse"
 
 logger = get_logger(__name__)
 
 
 class FallbackAttempt(BaseModel):
-    """Record of one attempt within a fallback chain."""
+    """回退链中单次尝试的记录。"""
 
     provider: str
     model_name: str
     status: str
     error_type: str | None = None
     error_message: str | None = None
+    retryable: bool = False
     elapsed_seconds: float = 0.0
-    response: "ChatResponse | None" = None
+    response: ChatResponse | None = None
 
 
 class FallbackResult(BaseModel):
-    """Outcome of executing a fallback chain."""
+    """执行回退链的结果。"""
 
-    response: "ChatResponse | None" = None
+    response: ChatResponse | None = None
     succeeded: bool = False
     attempts: list[FallbackAttempt] = Field(default_factory=list)
     final_error: str | None = None
 
     def summary(self) -> dict[str, typing.Any]:
-        """Return a serializable summary for logging and diagnostics."""
-
+        """返回用于日志和诊断的可序列化摘要。"""
         return {
             "succeeded": self.succeeded,
-            "attempts": [attempt.model_dump() for attempt in self.attempts],
+            "attempts": [attempt.model_dump(exclude={"response"}) for attempt in self.attempts],
             "final_error": self.final_error,
         }
 
 
 class FallbackExecutor:
-    """Execute a model request across a prioritized chain."""
+    """在优先级链上执行模型请求。"""
 
     def __init__(
         self,
@@ -75,134 +62,112 @@ class FallbackExecutor:
         max_attempts_per_provider: int = 1,
     ) -> None:
         if max_attempts_per_provider < 1:
-            raise ValueError("max_attempts_per_provider must be at least 1.")
+            raise ValueError("每个提供者的最大尝试次数至少为 1。")
 
         self._chain: list[ChatModel] = [primary, *secondaries]
         if not self._chain:
-            raise ValueError("Fallback chain must contain at least one model.")
+            raise ValueError("回退链至少需要包含一个模型。")
         self._max_attempts = max_attempts_per_provider
 
     @property
     def providers(self) -> list[str]:
-        """Return provider identifiers in execution order."""
-
+        """按执行顺序返回提供者标识符。"""
         return [model.name for model in self._chain]
 
     def invoke(self, request: ChatRequest) -> FallbackResult:
-        """Execute ``request`` synchronously across the fallback chain."""
-
+        """在回退链上同步执行请求。"""
         result = FallbackResult()
         for model in self._chain:
             for attempt_index in range(self._max_attempts):
                 attempt = self._try_once(model, request, attempt_index)
                 result.attempts.append(attempt)
+
                 if attempt.status == "success":
                     result.succeeded = True
-                    result.response = attempt.response  # type: ignore[assignment]
+                    result.response = attempt.response
                     return result
-                if not self._should_retry(attempt):
+
+                if not attempt.retryable:
                     break
-        result.final_error = result.attempts[-1].error_message if result.attempts else "No model available"
+
+        result.final_error = result.attempts[-1].error_message if result.attempts else "无可用模型"
         return result
 
     async def ainvoke(self, request: ChatRequest) -> FallbackResult:
+        """在回退链上异步执行请求。"""
         result = FallbackResult()
         for model in self._chain:
             for attempt_index in range(self._max_attempts):
                 attempt = await self._try_once_async(model, request, attempt_index)
                 result.attempts.append(attempt)
+
                 if attempt.status == "success":
                     result.succeeded = True
-                    result.response = attempt.response  # type: ignore[assignment]
+                    result.response = attempt.response
                     return result
-                if not self._should_retry(attempt):
+
+                if not attempt.retryable:
                     break
-        result.final_error = result.attempts[-1].error_message if result.attempts else "No model available"
+
+        result.final_error = result.attempts[-1].error_message if result.attempts else "无可用模型"
         return result
 
     def _try_once(self, model: ChatModel, request: ChatRequest, attempt_index: int) -> FallbackAttempt:
-        started = _monotonic()
+        started = time.perf_counter()
         try:
             response = model.invoke(request)
+            return FallbackAttempt(
+                provider=model.name,
+                model_name=getattr(model, "model_name", model.name),
+                status="success",
+                elapsed_seconds=time.perf_counter() - started,
+                response=response,
+            )
         except Exception as exc:
             return self._record_failure(model, exc, started, attempt_index)
-        return FallbackAttempt(
-            provider=model.name,
-            model_name=_safe_model_name(model),
-            status="success",
-            elapsed_seconds=_monotonic() - started,
-            response=response,
-        )
 
     async def _try_once_async(
         self, model: ChatModel, request: ChatRequest, attempt_index: int
     ) -> FallbackAttempt:
-        started = _monotonic()
+        started = time.perf_counter()
         try:
             response = await model.ainvoke(request)
+            return FallbackAttempt(
+                provider=model.name,
+                model_name=getattr(model, "model_name", model.name),
+                status="success",
+                elapsed_seconds=time.perf_counter() - started,
+                response=response,
+            )
         except Exception as exc:
             return self._record_failure(model, exc, started, attempt_index)
-        return FallbackAttempt(
-            provider=model.name,
-            model_name=_safe_model_name(model),
-            status="success",
-            elapsed_seconds=_monotonic() - started,
-            response=response,
-        )
 
     @staticmethod
     def _record_failure(
         model: ChatModel, exc: BaseException, started: float, attempt_index: int
     ) -> FallbackAttempt:
+        # 局部导入防止顶层的循环依赖
         from src.model.errors import classify_model_error
 
         classified = classify_model_error(exc, provider=model.name)
+        model_name = getattr(model, "model_name", model.name)
+
+        # 将 kwargs 风格改为标准的 logging 参数插值，避免底层 logger 不兼容报错
         logger.warning(
-            "model_fallback_attempt_failed",
-            provider=model.name,
-            model_name=_safe_model_name(model),
-            attempt=attempt_index + 1,
-            error_type=classified.error_type,
-            retryable=classified.retryable,
-            error=str(exc),
+            f"模型回退尝试失败 | provider={model.name} | model={model_name} | "
+            f"attempt={attempt_index + 1} | type={classified.error_type} | "
+            f"retryable={classified.retryable} | error={exc!s}"
         )
+
         return FallbackAttempt(
             provider=model.name,
-            model_name=_safe_model_name(model),
+            model_name=model_name,
             status="failed",
             error_type=classified.error_type,
             error_message=str(exc),
-            elapsed_seconds=_monotonic() - started,
+            retryable=classified.retryable,
+            elapsed_seconds=time.perf_counter() - started,
         )
-
-    @staticmethod
-    def _should_retry(attempt: FallbackAttempt) -> bool:
-        if attempt.status == "success":
-            return False
-        if attempt.error_type in {
-            "authentication",
-            "configuration",
-            "content_policy",
-            "payload",
-        }:
-            return False
-        return attempt.error_type in {"timeout", "connection", "rate_limit", "unknown"}
-
-
-def _safe_model_name(model: ChatModel) -> str:
-    return getattr(getattr(model, "_settings", None), "model_name", model.name)
-
-
-def _monotonic() -> float:
-    import time
-
-    return time.perf_counter()
 
 
 __all__ = ["FallbackAttempt", "FallbackExecutor", "FallbackResult"]
-
-
-# Resolve forward references now that manager has been imported.
-ChatResponse = _resolve_chat_response()
-FallbackAttempt.model_rebuild()
-FallbackResult.model_rebuild()

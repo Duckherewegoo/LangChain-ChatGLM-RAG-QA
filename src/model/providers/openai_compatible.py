@@ -1,13 +1,11 @@
-"""OpenAI-compatible chat model adapter.
+"""兼容 OpenAI 协议的对话模型适配器。
 
-This adapter targets endpoints that implement the OpenAI Chat Completions
-protocol, including DeepSeek, Qwen/DashScope compatible mode, ZhipuAI's
-compatible endpoint, and arbitrary gateways exposing the same contract.
-Provider-specific modules may subclass it to adjust defaults or normalize
-provider-specific response quirks.
+本适配器针对实现了 OpenAI Chat Completions 协议的端点，
+包括 DeepSeek、Qwen/DashScope 兼容模式、智谱 AI 兼容端点以及任意提供相同契约的网关。
+特定厂商的模块可以通过继承它来调整默认值或归一化特有响应。
 
-The implementation deliberately uses ``httpx`` directly rather than a heavier
-chain wrapper, keeping dependency weight and failure modes explicit.
+实现上刻意直接使用 httpx，而不引入更重的链式包装器，
+从而保持依赖权重和故障模式的显式可控。
 """
 
 from __future__ import annotations
@@ -24,35 +22,42 @@ from src.model.errors import (
     ModelConfigurationError,
     ModelContentPolicyError,
     ModelPayloadError,
+    ModelRateLimitError,
     ModelTimeoutError,
     is_retryable,
 )
-from src.model.manager import ChatModel, ChatRequest, ChatResponse
+from src.model.protocol import ChatModel, ChatRequest, ChatResponse
 from src.observability import get_logger
 
-if typing.TYPE_CHECKING:
+if typing.TYPE_CHECKING:  # 仅用于类型检查
     from src.settings import ModelChatSettings
 
 logger = get_logger(__name__)
 
-_DEFAULT_MAX_TOKENS = 2048
 
+class _OpenAICompatibleChatModel:
+    """兼容 OpenAI 协议的对话端点基础适配器。"""
 
-class _OpenAICompatibleChatModel(ChatModel):
-    """Base adapter for OpenAI-compatible chat endpoints."""
-
+    name: str = "openai_compatible"
+    model_name: str = ""
     DEFAULT_BASE_URL = ""
     DEFAULT_MAX_RETRIES = 1
 
     def __init__(self, settings: ModelChatSettings) -> None:
         self._settings = settings
+        self.model_name = settings.model_name
         self._assert_configured()
+
+        # 同步客户端实例化
         self._client = httpx.Client(timeout=settings.timeout_seconds)
+        # 异步客户端也实例化在这里，避免每次请求重新建连
+        self._async_client = httpx.AsyncClient(timeout=settings.timeout_seconds)
+        self._bound_tools: list[dict[str, typing.Any]] | None = None
 
     def _assert_configured(self) -> None:
         if not self._settings.is_configured:
             raise ModelConfigurationError(
-                "Chat model API key is empty; configure MODEL_CHAT_API_KEY or settings.yaml.",
+                "对话模型 API Key 为空；请配置 MODEL_CHAT_API_KEY 或 settings.yaml。",
                 details={
                     "provider": self._settings.provider,
                     "model_name": self._settings.model_name,
@@ -78,9 +83,22 @@ class _OpenAICompatibleChatModel(ChatModel):
         tools: typing.Sequence[dict[str, typing.Any]] | None = None,
         tool_choice: str | dict[str, typing.Any] | None = None,
     ) -> dict[str, typing.Any]:
+
+        # 修复：手动转换消息格式，不再依赖未实现的 ChatRequest 方法
+        openai_messages = []
+        for msg in request.messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            item = {"role": role, "content": content}
+            if "tool_calls" in msg:
+                item["tool_calls"] = msg["tool_calls"]
+            if "tool_call_id" in msg:
+                item["tool_call_id"] = msg["tool_call_id"]
+            openai_messages.append(item)
+
         payload: dict[str, typing.Any] = {
             "model": self._settings.model_name,
-            "messages": request.to_openai_messages(),
+            "messages": openai_messages,
             "temperature": self._settings.temperature,
         }
         if self._settings.max_tokens:
@@ -112,12 +130,10 @@ class _OpenAICompatibleChatModel(ChatModel):
                 if attempts >= maximum or not is_retryable(exc, provider=self._settings.provider):
                     raise
                 delay = min(2 ** (attempts - 1), 8)
+                # 修复：改为标准的 logging 格式化
                 logger.warning(
-                    "model_retry_scheduled",
-                    provider=self._settings.provider,
-                    attempt=attempts,
-                    delay=delay,
-                    error=str(exc),
+                    f"模型重试已调度 | provider={self._settings.provider} | "
+                    f"attempt={attempts} | delay={delay}s | error={exc!s}"
                 )
                 time.sleep(delay)
 
@@ -133,19 +149,16 @@ class _OpenAICompatibleChatModel(ChatModel):
                     raise
                 delay = min(2 ** (attempts - 1), 8)
                 logger.warning(
-                    "model_retry_scheduled",
-                    provider=self._settings.provider,
-                    attempt=attempts,
-                    delay=delay,
-                    error=str(exc),
+                    f"模型重试已调度(异步) | provider={self._settings.provider} | "
+                    f"attempt={attempts} | delay={delay}s | error={exc!s}"
                 )
                 await _async_sleep(delay)
 
     def _post(self, request: ChatRequest) -> ChatResponse:
         payload = self._payload(
             request,
-            tools=getattr(self, "_bound_tools", None) or None,
-            tool_choice="auto" if getattr(self, "_bound_tools", None) else None,
+            tools=self._bound_tools,
+            tool_choice="auto" if self._bound_tools else None,
         )
         started = time.perf_counter()
         try:
@@ -156,12 +169,12 @@ class _OpenAICompatibleChatModel(ChatModel):
             )
         except httpx.TimeoutException as exc:
             raise ModelTimeoutError(
-                f"Model request timed out after {time.perf_counter() - started:.2f}s: {exc}",
+                f"模型请求超时 ({time.perf_counter() - started:.2f}s): {exc}",
                 details={"provider": self._settings.provider},
             ) from exc
         except httpx.HTTPError as exc:
             raise ModelAPIConnectionError(
-                f"Model connection failed: {exc}",
+                f"模型连接失败: {exc}",
                 details={"provider": self._settings.provider},
             ) from exc
 
@@ -170,56 +183,62 @@ class _OpenAICompatibleChatModel(ChatModel):
     async def _apost(self, request: ChatRequest) -> ChatResponse:
         payload = self._payload(
             request,
-            tools=getattr(self, "_bound_tools", None) or None,
-            tool_choice="auto" if getattr(self, "_bound_tools", None) else None,
+            tools=self._bound_tools,
+            tool_choice="auto" if self._bound_tools else None,
         )
         started = time.perf_counter()
-        async with httpx.AsyncClient(timeout=self._settings.timeout_seconds) as client:
-            try:
-                response = await client.post(
-                    self._endpoint,
-                    json=payload,
-                    headers=self._headers(),
-                )
-            except httpx.TimeoutException as exc:
-                raise ModelTimeoutError(
-                    f"Model request timed out after {time.perf_counter() - started:.2f}s: {exc}",
-                    details={"provider": self._settings.provider},
-                ) from exc
-            except httpx.HTTPError as exc:
-                raise ModelAPIConnectionError(
-                    f"Model connection failed: {exc}",
-                    details={"provider": self._settings.provider},
-                ) from exc
+        try:
+            response = await self._async_client.post(
+                self._endpoint,
+                json=payload,
+                headers=self._headers(),
+            )
+        except httpx.TimeoutException as exc:
+            raise ModelTimeoutError(
+                f"模型请求超时 ({time.perf_counter() - started:.2f}s): {exc}",
+                details={"provider": self._settings.provider},
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ModelAPIConnectionError(
+                f"模型连接失败: {exc}",
+                details={"provider": self._settings.provider},
+            ) from exc
         return self._parse_response(response, latency=time.perf_counter() - started)
 
     def _parse_response(self, response: httpx.Response, *, latency: float) -> ChatResponse:
         if response.status_code == 401:
             raise ModelAuthenticationError(
-                f"Model authentication failed: {response.text[:300]}",
+                f"模型认证失败: {response.text[:300]}",
+                details={"provider": self._settings.provider, "status_code": response.status_code},
+            )
+        # 修复：显式拦截 429 限流
+        if response.status_code == 429:
+            raise ModelRateLimitError(
+                f"模型请求被限流 (429): {response.text[:300]}",
                 details={"provider": self._settings.provider, "status_code": response.status_code},
             )
         if response.status_code in {400, 200} and "content policy" in response.text.lower():
             raise ModelContentPolicyError(
-                f"Model response blocked by content policy: {response.text[:300]}",
+                f"模型响应被内容策略阻断: {response.text[:300]}",
                 details={"provider": self._settings.provider},
             )
         if response.status_code >= 400:
             raise ModelAPIConnectionError(
-                f"Model request failed ({response.status_code}): {response.text[:500]}",
+                f"模型请求失败 ({response.status_code}): {response.text[:500]}",
                 details={"provider": self._settings.provider, "status_code": response.status_code},
             )
         try:
             data = response.json()
         except json.JSONDecodeError as exc:
             raise ModelPayloadError(
-                f"Model returned invalid JSON: {response.text[:300]}",
+                f"模型返回了无效的 JSON: {response.text[:300]}",
                 details={"provider": self._settings.provider},
             ) from exc
 
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         content = message.get("content") or ""
+
         tool_calls = [
             {
                 "id": call.get("id") or call.get("tool_call_id"),
@@ -242,10 +261,18 @@ class _OpenAICompatibleChatModel(ChatModel):
         )
 
     def close(self) -> None:
+        """关闭同步客户端。"""
         try:
             self._client.close()
         except Exception as exc:
-            logger.debug("http_client_close_failed", extra={"error": str(exc)})
+            logger.debug(f"http_client_close_failed | error={exc!s}")
+
+    async def aclose(self) -> None:
+        """关闭异步客户端。"""
+        try:
+            await self._async_client.aclose()
+        except Exception as exc:
+            logger.debug(f"http_async_client_close_failed | error={exc!s}")
 
     def __enter__(self) -> _OpenAICompatibleChatModel:
         return self
@@ -255,8 +282,7 @@ class _OpenAICompatibleChatModel(ChatModel):
 
 
 class OpenAICompatibleChatModel(_OpenAICompatibleChatModel):
-    """Public alias for the OpenAI-compatible adapter."""
-
+    """兼容 OpenAI 适配器的公开别名。"""
     name = "openai_compatible"
 
 
@@ -284,7 +310,6 @@ def _coerce_int(value: typing.Any) -> int | None:
 async def _async_sleep(seconds: float) -> None:
     try:
         import asyncio
-
         await asyncio.sleep(seconds)
     except RuntimeError:
         time.sleep(seconds)
