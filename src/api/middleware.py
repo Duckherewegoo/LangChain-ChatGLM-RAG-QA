@@ -1,14 +1,13 @@
-"""API middleware and unified exception mapping.
+"""API 中间件与统一异常映射。
 
-This module translates Python built-ins, Pydantic validation errors, and
-project domain exceptions into structured responses. It must never let a raw
-stack trace or secret material reach the client. Transient infrastructure
-errors receive a safe generic message; a request-scoped correlation ID is
-attached to every response.
+本模块将 Python 内置异常、Pydantic 校验错误以及项目领域异常翻译为结构化的
+JSON 响应。它必须绝不让原始堆栈或密钥材料流向客户端。对于瞬态的基建错误，
+返回安全的通用提示；每个响应都附带与当前请求关联的追踪 ID。
 """
 
 from __future__ import annotations
 
+import re
 import typing
 import uuid
 
@@ -19,11 +18,11 @@ from src.observability import get_logger, start_request
 
 logger = get_logger(__name__)
 
-_SAFE_INTERNAL_MESSAGE = "An unexpected internal error occurred."
+_SAFE_INTERNAL_MESSAGE = "服务端发生内部错误，请稍后重试或联系管理员。"
 
 
 class ErrorEnvelope(BaseModel):
-    """Canonical API error response."""
+    """标准的 API 错误响应体。"""
 
     error: str
     message: str
@@ -32,20 +31,19 @@ class ErrorEnvelope(BaseModel):
 
 
 class RequestContext(BaseModel):
-    """Request correlation and tracing context."""
+    """请求关联与追踪上下文。"""
 
     request_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     user_id: str | None = None
     tenant_id: str | None = "default"
 
     def bind(self) -> None:
-        """Bind this context to the current execution scope."""
-
+        """将当前上下文绑定到执行作用域。"""
         start_request(self.request_id)
 
 
 def map_exception(exc: BaseException, *, request_id: str | None = None) -> tuple[int, ErrorEnvelope]:
-    """Map any exception to a stable HTTP response envelope."""
+    """将任意异常映射为稳定的 HTTP 响应信封（状态码 + 响应体）。"""
 
     if isinstance(exc, RAGError):
         return exc.status_code, ErrorEnvelope(
@@ -58,46 +56,47 @@ def map_exception(exc: BaseException, *, request_id: str | None = None) -> tuple
     if isinstance(exc, ValueError):
         return 400, ErrorEnvelope(
             error="invalid_argument",
-            message=str(exc) or "Invalid request argument.",
+            message=str(exc) or "请求参数无效。",
             request_id=request_id,
         )
 
     if isinstance(exc, FileNotFoundError):
         return 404, ErrorEnvelope(
             error="resource_not_found",
-            message="The requested resource was not found.",
+            message="请求的资源未找到。",
             request_id=request_id,
         )
 
     if isinstance(exc, PermissionError):
         return 403, ErrorEnvelope(
             error="permission_denied",
-            message="The operation is not allowed for the current principal.",
+            message="当前主体无权执行该操作。",
             request_id=request_id,
         )
 
     if isinstance(exc, TimeoutError):
         return 504, ErrorEnvelope(
             error="upstream_timeout",
-            message="An upstream dependency timed out.",
+            message="上游依赖服务响应超时。",
             request_id=request_id,
         )
 
     if isinstance(exc, ConnectionError):
         return 502, ErrorEnvelope(
             error="upstream_unavailable",
-            message="An upstream dependency is unavailable.",
+            message="上游依赖服务当前不可用。",
             request_id=request_id,
         )
 
     if isinstance(exc, NotImplementedError):
         return 501, ErrorEnvelope(
             error="not_implemented",
-            message="The requested capability is not implemented.",
+            message="请求的能力尚未实现。",
             request_id=request_id,
         )
 
-    logger.exception("unexpected_api_error", extra={"request_id": request_id})
+    # 修复语法错误，并确保日志格式兼容
+    logger.exception(f"unexpected_api_error | request_id={request_id}")
     return 500, ErrorEnvelope(
         error="internal_error",
         message=_SAFE_INTERNAL_MESSAGE,
@@ -106,21 +105,36 @@ def map_exception(exc: BaseException, *, request_id: str | None = None) -> tuple
 
 
 def ensure_request_id(existing: str | None) -> str:
-    """Return the existing request ID or generate a new one."""
-
+    """返回现有的请求 ID，若不存在则生成一个新的。"""
     return existing or uuid.uuid4().hex
 
 
-def _safe_details(details: typing.Any) -> dict[str, typing.Any]:
-    """Remove potentially sensitive keys from error details."""
+# 精确匹配真正的敏感信息字段，防止误伤诸如 max_tokens 等正常字段
+_SENSITIVE_KEYS = frozenset({
+    "api_key", "apikey", "password", "passwd", "secret", "token",
+    "access_token", "refresh_token", "authorization", "credential",
+})
 
+# 匹配常见的密钥格式（如 sk-...）
+_SECRET_VALUE_PATTERN = re.compile(
+    r"(sk-[A-Za-z0-9]{8,}|Bearer\s+[A-Za-z0-9._\-]{8,})"
+)
+
+
+def _safe_details(details: typing.Any) -> dict[str, typing.Any]:
+    """从错误详情中移除潜在的敏感信息。
+
+    仅对明确敏感键名或符合特定密钥模式的值进行脱敏，避免误伤正常字段。
+    """
     if not isinstance(details, dict):
         return {}
+
     redacted = dict(details)
-    for key in list(redacted):
-        lowered = key.lower()
-        if any(secret in lowered for secret in ("api_key", "password", "token", "secret", "authorization")):
+    for key, value in list(redacted.items()):
+        if key.lower() in _SENSITIVE_KEYS:
             redacted[key] = "[redacted]"
+        elif isinstance(value, str):
+            redacted[key] = _SECRET_VALUE_PATTERN.sub("[REDACTED]", value)
     return redacted
 
 
