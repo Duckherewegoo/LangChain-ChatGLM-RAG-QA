@@ -1,35 +1,21 @@
 """Agent 角色体系：明确"这个 Agent 到底是干什么的"。
 
 整个系统对外只暴露一种产品语义——"企业知识库问答"。但实现上它由若干
-**职责单一**的角色协作完成。每个角色都是一段带约束的系统提示 + 一组
-能力边界，而**不是一个独立进程**：角色之间在同一张 LangGraph 里用消息
-传递协作，没有引入额外编排框架。
+职责单一的角色协作完成。每个角色都是一段带约束的系统提示 + 一组能力边界，
+而不是一个独立进程：角色之间在同一张 LangGraph 里用消息传递协作，没有引入额外编排框架。
 
-角色清单
---------
-:class:`RetrieverRole`
-    只做检索规划与证据汇总。它决定"该问知识库什么问题"，但**不**回答。
-    对应 harness 的 ``retrieve`` 阶段。
-:class:`ReasonerRole`
-    拿到证据后做推理与答案综合。它**必须**引用证据，不能凭空回答。
-    对应 harness 的 ``reason`` 阶段。
-:class:`ReviewerRole`
-    审核最终答案的事实性、引用完整性、合规性、口径一致性。它有权力要求
-    上一环节重做，但不能自己编造证据。对应 harness 的 ``review`` 阶段。
-:class:`OrchestratorRole`
-    把请求路由到合适的角色，决定何时收工。它不做任何业务计算。
+角色清单：
+- RetrieverRole：只做检索规划与证据汇总，不回答。
+- ReasonerRole：拿到证据后做推理与答案综合，必须引用证据，不能凭空回答。
+- ReviewerRole：审核最终答案的事实性、引用完整性等，有权力要求上一环节重做，但不能自己编造。
+- OrchestratorRole：把请求路由到合适的角色，决定何时收工，不做任何业务计算。
 
-设计要点
---------
-* 每个角色的提示词都用 :class:`RoleDefinition` 数据类描述，包含
-  ``name`` / ``purpose`` / ``responsibilities`` / ``must_not`` /
-  ``output_contract``。这不是文档装饰——**它是 Agent 的契约**，会进入
-  harness 的系统提示与审计事件，运行期可见。
-* 角色协作走"共享黑板"模式：一个 ``dict`` 承载各角色产出，角色只读写
-  自己关心的键。这比直接传参更利于审计，也比多进程轻得多。
-* 角色是**纯声明**，不持有 LLM 或工具引用。真正调用模型的是
-  :class:`~src.rag.agent.Harness`，角色只提供"该怎么问模型"。这避免了
-  "上帝对象"——一个角色同时知道怎么检索、怎么审核、怎么调模型。
+设计要点：
+1. 每个角色的提示词都用 RoleDefinition 数据类描述，包含 name / purpose /
+   responsibilities / must_not / output_contract。这不是文档装饰，而是
+   Agent 的契约，会进入 harness 的系统提示与审计事件，运行期可见。
+2. 角色协作走"共享黑板"模式：一个 dict 承载各角色产出，角色只读写自己关心的键。
+3. 角色是纯声明，不持有 LLM 或工具引用。真正调用模型的是 AgentOrchestrator。
 """
 
 from __future__ import annotations
@@ -40,16 +26,12 @@ from abc import ABC, abstractmethod
 
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# 契约：一个角色到底是干什么的
-# ---------------------------------------------------------------------------
-
 
 @dataclasses.dataclass(frozen=True)
 class RoleDefinition:
     """不可变的角色契约。
 
-    ``must_not`` 和 ``output_contract`` 不是建议——harness 会读取它们来做
+    must_not 和 output_contract 不是建议——orchestrator 会读取它们来做
     校验与审计。把"禁止做什么"写成数据，而不是散落在提示词字符串里，
     才能被单元测试覆盖。
     """
@@ -76,8 +58,8 @@ class RoleDefinition:
 class AgentDefinition:
     """整个 Agent 的对外声明。
 
-    这是回答"这个 Agent 到底是干什么的"的**唯一权威来源**。它被序列化成
-    API 的 ``/agent/definition`` 响应、写入审计事件、也进入 harness 的
+    这是回答"这个 Agent 到底是干什么的"的唯一权威来源。它被序列化成
+    API 的 /agent/definition 响应、写入审计事件、也进入 orchestrator 的
     系统提示。三层来源一致，避免"文档说一套、代码做一套"。
     """
 
@@ -104,28 +86,23 @@ class AgentDefinition:
         }
 
 
-# ---------------------------------------------------------------------------
-# 抽象基类
-# ---------------------------------------------------------------------------
-
-
 class Role(ABC):
     """一个职责单一的 Agent 角色。
 
-    子类只实现两件事：声明自己是谁（``definition``），以及把自己的任务
-    描述成模型能执行的提示词（``build_prompt``）。真正调模型、解析输出
-    的是 harness，子类不持有模型引用。
+    子类只实现两件事：声明自己是谁（definition），以及把自己的任务
+    描述成模型能执行的提示词（build_prompt）。真正调模型、解析输出
+    的是 orchestrator，子类不持有模型引用。
     """
 
     definition: RoleDefinition
 
     @abstractmethod
-    def build_prompt(self, blackboard: Blackboard) -> str:
+    def build_prompt(self, blackboard: "Blackboard") -> str:
         """根据本角色关心的上下文，构造一次模型调用要用的系统提示片段。"""
+        ...
 
-    def can_handle(self, blackboard: Blackboard) -> bool:
+    def can_handle(self, blackboard: "Blackboard") -> bool:
         """该角色是否应该在这一轮介入。默认：永远介入。"""
-
         return True
 
     def __repr__(self) -> str:
@@ -135,9 +112,8 @@ class Role(ABC):
 class Blackboard(BaseModel):
     """角色间共享的、可审计的工作区。
 
-    键的命名即协议：``original_question`` / ``rewritten_queries`` /
-    ``evidence`` / ``answer`` / ``review``。角色只读写自己声明的键，这
-    是一种廉价的、可读的协作契约，比强类型通道更适合迭代。
+    键的命名即协议：original_question / rewritten_queries / evidence / answer / review。
+    角色只读写自己声明的键，这是一种廉价的、可读的协作契约，比强类型通道更适合迭代。
     """
 
     request_id: str
@@ -158,13 +134,7 @@ class Blackboard(BaseModel):
 
     def snapshot(self) -> dict[str, typing.Any]:
         """返回一份可序列化的副本，用于审计与 API 响应。"""
-
         return self.model_dump(exclude_none=True)
-
-
-# ---------------------------------------------------------------------------
-# 具体角色
-# ---------------------------------------------------------------------------
 
 
 class RetrieverRole(Role):
@@ -192,10 +162,11 @@ class RetrieverRole(Role):
 
     def build_prompt(self, blackboard: Blackboard) -> str:
         queries = blackboard.rewritten_queries or [blackboard.original_question]
+        queries_text = "\n".join(f"- {q}" for q in queries)
         return (
             "你是企业知识库的检索规划者。你的唯一产出是检索计划与证据清单，不要回答用户。\n"
             f"原始问题：{blackboard.original_question}\n"
-            f"已生成的检索查询：{queries}\n"
+            f"已生成的检索查询：\n{queries_text}\n"
             "请说明：1) 你打算如何拆分这个问题；2) 哪些信息是当前证据无法覆盖的。"
         )
 
@@ -229,9 +200,10 @@ class ReasonerRole(Role):
 
     def build_prompt(self, blackboard: Blackboard) -> str:
         evidence = blackboard.evidence or []
+        # 移除了硬编码的 [:500] 截断，交由上层通过 max_evidence_chars 控制预算
         evidence_text = "\n".join(
             f"[{index + 1}] {item.get('source', '未知来源')}: "
-            f"{(item.get('snippet') or item.get('content') or '')[:500]}"
+            f"{item.get('snippet') or item.get('content') or ''}"
             for index, item in enumerate(evidence)
         ) or "（当前无可用证据）"
         return (
@@ -250,9 +222,7 @@ class ReasonerRole(Role):
 class ReviewerRole(Role):
     """答案审核者：事实性、引用完整性、合规性、口径一致性。
 
-    审核是**结构化的、可重试的**——它会返回一组 :class:`ReviewIssue`，
-    而不是一段不可解析的评语。这让它可以被单元测试覆盖，也让 harness
-    能据此决定是否重做。
+    审核是结构化的、可重试的——它会返回一组 ReviewIssue，而不是一段不可解析的评语。
     """
 
     definition = RoleDefinition(
@@ -279,9 +249,10 @@ class ReviewerRole(Role):
 
     def build_prompt(self, blackboard: Blackboard) -> str:
         evidence = blackboard.evidence or []
+        # 移除了硬编码的 [:400] 截断，交由上层控制
         evidence_text = "\n".join(
             f"[{index + 1}] {item.get('source', '未知来源')}: "
-            f"{(item.get('snippet') or item.get('content') or '')[:400]}"
+            f"{item.get('snippet') or item.get('content') or ''}"
             for index, item in enumerate(evidence)
         ) or "（无证据）"
         return (
@@ -299,7 +270,9 @@ class ReviewerRole(Role):
 class OrchestratorRole(Role):
     """请求编排者：决定下一步该谁上。
 
-    它把请求路由到合适的角色、维护轮次预算、决定何时收工。它自己不计算。
+    注意：在当前的 AgentOrchestrator 实现中，流水线是硬编码的
+    (retrieve -> reason -> review)。此角色的 build_prompt 并未被使用，
+    仅用于在 AgentDefinition 中声明系统的顶层职责。
     """
 
     definition = RoleDefinition(
@@ -320,18 +293,8 @@ class OrchestratorRole(Role):
     )
 
     def build_prompt(self, blackboard: Blackboard) -> str:
-        return (
-            "你是请求编排者。只输出本轮应调度的角色与理由，不要回答业务问题。\n"
-            f"当前黑板状态：问题={blackboard.original_question!r}, "
-            f"已有证据={len(blackboard.evidence)}条, "
-            f"已有草稿={'是' if blackboard.answer_draft else '否'}, "
-            f"审核轮次={blackboard.review_rounds}。"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Agent 声明（系统唯一权威来源）
-# ---------------------------------------------------------------------------
+        # 此方法在流水线中不会被调用，因为编排逻辑由 Python 代码硬编码执行
+        raise NotImplementedError("OrchestratorRole 不参与具体的 LLM 生成流程。")
 
 
 def enterprise_qa_definition() -> AgentDefinition:
@@ -339,7 +302,6 @@ def enterprise_qa_definition() -> AgentDefinition:
 
     集中在一处定义，避免"文档、提示词、API 响应"三套口径互相打架。
     """
-
     return AgentDefinition(
         name="enterprise-knowledge-agent",
         version="1.0.0",

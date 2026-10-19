@@ -1,42 +1,33 @@
-"""Agent tools, guardrails, and tool invocation records.
+"""Agent 工具、护栏与工具调用记录。
 
-Tools are deliberately narrow: each handler validates its arguments, executes one
-responsibility, and returns a serializable result.
+工具被刻意设计得极其狭隘：每个处理程序验证自己的参数，执行单一职责，并返回可序列化的结果。
 
-Design notes
-------------
-* A :class:`ToolRegistry` is the **union of all registered tools**; the allow
-  list is applied at ``list_tools`` / ``get`` / ``has`` time, so a registry
-  built with an explicit allow list exposes exactly those tools and rejects
-  every other name. This fixes the previous bug where ``ToolRegistry(["a"])``
-  accepted ``"b"`` because the allow set was populated *after* registration.
-* Tools come from pluggable :class:`~src.rag.tool_sources.ToolSource` providers.
-  Two built-in sources exist: :class:`LocalToolSource` (the classic in-process
-  handlers) and :class:`MCPToolSource` (tools surfaced by an MCP server). New
-  sources are opt-in extensions, never hardcoded knowledge.
-* Guardrails enforce iteration/tool budgets and detect common prompt-injection
-  patterns. They are pure checks with no I/O, so they can run in tight loops.
+设计说明：
+1. ToolRegistry 是所有已注册工具的并集；白名单在 list_tools / get / has 时生效，
+   因此带有显式白名单构建的注册表只会暴露那些工具，并拒绝其他所有名称。
+2. 工具来自可插拔的 ToolSource。内置来源有 LocalToolSource 和 MCPToolSource。
+3. 护栏强制执行迭代/工具预算，并检测常见的提示词注入模式。它们是纯检查，
+   没有 I/O，因此可以在紧循环中运行。
 """
 
 from __future__ import annotations
 
-import importlib
 import logging
 import re
+import threading
 import typing
 
 from pydantic import BaseModel, Field
 
-from src.exceptions import PermissionDeniedError, ValidationError
+from src.exceptions import AgentExecutionError, PermissionDeniedError, ValidationError
 from src.rag.tool_sources import (
     LocalToolSource,
-    MCPToolSource,
     ToolSource,
-    ToolSpec,
     create_tool_source,
 )
+from src.rag.tool_types import ToolContext, ToolHandler, ToolSpec
 
-if typing.TYPE_CHECKING:  # pragma: no cover - type checking only
+if typing.TYPE_CHECKING:  # 仅用于类型检查
     from src.rag.service import RAGService
     from src.settings import GuardrailsSettings
 
@@ -50,8 +41,16 @@ _INJECTION_PATTERNS = [
 ]
 
 
+class AgentBudgetExceeded(AgentExecutionError):
+    """智能体超出执行预算时抛出。"""
+    status_code = 429
+    error_code = "agent_budget_exceeded"
+
+
 class ToolCallRecord(BaseModel):
-    """Immutable record of a tool invocation and its result."""
+    """不可变的工具调用及其结果记录。"""
+
+    model_config = {"frozen": True}
 
     tool: str
     arguments: dict[str, typing.Any] = Field(default_factory=dict)
@@ -61,8 +60,7 @@ class ToolCallRecord(BaseModel):
     source: str = "local"
 
     def for_audit(self) -> dict[str, typing.Any]:
-        """Return a safe representation suitable for audit logs."""
-
+        """返回适合审计日志的安全表示。"""
         return {
             "tool": self.tool,
             "status": self.status,
@@ -72,43 +70,20 @@ class ToolCallRecord(BaseModel):
         }
 
 
-class ToolContext(BaseModel):
-    """Invocation context passed to tool handlers."""
-
-    tenant_id: str = "default"
-    owner_id: str | None = None
-    allowed_sources: list[str] = Field(default_factory=list)
-    request_id: str | None = None
-
-
-class ToolHandler(typing.Protocol):
-    """Protocol implemented by every local tool handler."""
-
-    def __call__(self, arguments: dict[str, typing.Any], context: ToolContext) -> typing.Any: ...
-
-
 def _normalize_allow_list(allowed_tools: typing.Iterable[str] | None) -> set[str] | None:
-    """Translate the public API into an internal representation.
+    """将公共 API 转换为内部表示。
 
-    ``None``           -> allow every currently and future-registered tool.
-    ``[]``             -> allow nothing (defense in depth).
-    ``["a", "b"]``     -> allow exactly that set; non-registered names are
-                          *not* silently dropped, so misconfiguration is loud.
+    None -> 允许当前和未来注册的所有工具。
+    []   -> 什么都不允许（纵深防御）。
+    ["a", "b"] -> 只允许该集合。
     """
-
     if allowed_tools is None:
         return None
     return set(allowed_tools)
 
 
 class ToolRegistry:
-    """Union of tool sources, with an explicit allow list and schema validation.
-
-    The registry owns no tool implementations. It asks each configured
-    :class:`ToolSource` for its specs, dedupes them by name (source order wins),
-    and then answers ``list_tools`` / ``get`` / ``has`` through the allow list.
-    This keeps the registry a *coordinator*, never a god object.
-    """
+    """带有显式白名单和模式验证的工具来源联合体。"""
 
     RETRIEVE_TOOL_NAME = "retrieve_knowledge"
 
@@ -121,54 +96,46 @@ class ToolRegistry:
         self._sources: list[ToolSource] = list(sources or [])
         self._allowed = _normalize_allow_list(allowed_tools)
         self._spec_cache: dict[str, ToolSpec] | None = None
-
-    # ---- source management (open for extension) -----------------------------
+        self._cache_lock = threading.Lock()
 
     def add_source(self, source: ToolSource) -> None:
-        """Attach a tool source. Sources are queried in insertion order."""
-
+        """附加一个工具来源。来源按插入顺序查询。"""
         if not isinstance(source, ToolSource):
-            raise TypeError(
-                f"Tool source must implement ToolSource, got {type(source).__name__}."
-            )
-        self._sources.append(source)
-        self._spec_cache = None
+            raise TypeError(f"工具来源必须实现 ToolSource，实际为 {type(source).__name__}。")
+        with self._cache_lock:
+            self._sources.append(source)
+            self._spec_cache = None
 
     def set_allowed(self, allowed_tools: typing.Iterable[str]) -> None:
-        """Replace the allow list at runtime. ``[]`` means allow nothing."""
-
-        self._allowed = _normalize_allow_list(allowed_tools)
-
-    # ---- spec resolution ----------------------------------------------------
+        """运行时替换白名单。[] 表示什么都不允许。"""
+        with self._cache_lock:
+            self._allowed = _normalize_allow_list(allowed_tools)
 
     def _resolve_specs(self) -> dict[str, ToolSpec]:
-        """Return ``{name: spec}`` with first-source-wins deduplication."""
-
-        if self._spec_cache is not None:
-            return self._spec_cache
-        specs: dict[str, ToolSpec] = {}
-        for source in self._sources:
-            for spec in source.list_specs():
-                specs.setdefault(spec.name, spec)
-        self._spec_cache = specs
-        return specs
+        """返回 {name: spec}，首次来源优先去重。"""
+        with self._cache_lock:
+            if self._spec_cache is not None:
+                return self._spec_cache
+            specs: dict[str, ToolSpec] = {}
+            for source in self._sources:
+                for spec in source.list_specs():
+                    specs.setdefault(spec.name, spec)
+            self._spec_cache = specs
+            return specs
 
     def names(self) -> list[str]:
-        """Every registered tool name, regardless of allow list."""
-
+        """所有已注册的工具名称，无论白名单如何。"""
         return sorted(self._resolve_specs())
 
     def allowed_names(self) -> list[str]:
-        """Tool names visible to the agent right now."""
-
+        """智能体当前可见的工具名称。"""
         specs = self._resolve_specs()
         if self._allowed is None:
             return sorted(specs)
         return sorted(name for name in specs if name in self._allowed)
 
     def has(self, name: str) -> bool:
-        """Return True when the tool exists *and* passes the allow list."""
-
+        """当工具存在且通过白名单时返回 True。"""
         specs = self._resolve_specs()
         if name not in specs:
             return False
@@ -177,63 +144,48 @@ class ToolRegistry:
         return name in self._allowed
 
     def list_tools(self) -> list[dict[str, typing.Any]]:
-        """OpenAI-compatible tool definitions for the current allow list."""
-
+        """当前白名单的 OpenAI 兼容工具定义。"""
         specs = self._resolve_specs()
         visible = self.allowed_names()
         return [
-            {"type": "function", "function": {"name": name, **specs[name].schema}}
+            {"type": "function", "function": {"name": name, **specs[name].input_schema}}
             for name in visible
         ]
 
-    # ---- invocation --------------------------------------------------------
-
     def get(self, name: str) -> ToolHandler:
-        """Return a callable for ``name``, enforcing registration and allow list.
-
-        MCP-sourced tools are wrapped in a local callable so the execution path
-        stays uniform: the agent never knows whether a tool is in-process or
-        remote. This is the seam that makes MCP a pluggable extension.
-        """
-
+        """返回 name 的可调用对象，强制执行注册和白名单检查。"""
         specs = self._resolve_specs()
         if name not in specs:
             raise PermissionDeniedError(
-                f"Unknown tool: {name!r}.",
+                f"未知工具：{name!r}。",
                 details={"registered_tools": sorted(specs)},
             )
         if self._allowed is not None and name not in self._allowed:
             raise PermissionDeniedError(
-                f"Tool {name!r} is not permitted by the current agent configuration.",
+                f"工具 {name!r} 不被当前智能体配置允许。",
                 details={"allowed_tools": self.allowed_names()},
             )
         spec = specs[name]
         return self._wrap_spec(spec)
 
     def _wrap_spec(self, spec: ToolSpec) -> ToolHandler:
-        """Adapt a :class:`ToolSpec` into a plain callable."""
-
+        """将 ToolSpec 适配为普通可调用对象。"""
         source = spec.source
         if isinstance(source, LocalToolSource):
             return source.get_handler(spec.name)
 
         def _mcp_bridge(arguments: dict[str, typing.Any], context: ToolContext) -> typing.Any:
-            # MCP call sites already translate SDK exceptions into ToolExecutionError
-            # or the spec's declared exception class; we do not invent a new contract.
             return source.invoke(spec.name, arguments, context=context)
 
         return _mcp_bridge
 
-    # ---- lifecycle ---------------------------------------------------------
-
     def close(self) -> None:
-        """Release resources held by every source (MCP sessions, etc.)."""
-
+        """释放每个来源持有的资源（MCP 会话等）。"""
         for source in self._sources:
             try:
                 source.close()
             except Exception:
-                logger.exception("tool_source_close_failed", extra={"source": type(source).__name__})
+                logger.exception(f"关闭工具来源失败 | source={type(source).__name__}")
 
     def __enter__(self) -> ToolRegistry:
         return self
@@ -242,15 +194,8 @@ class ToolRegistry:
         self.close()
 
 
-def create_rag_tool_registry(service: RAGService) -> ToolRegistry:
-    """Create a registry containing retrieval and citation utilities.
-
-    The registry owns no tool implementations. All tools are contributed by
-    ``ToolSource`` providers; the registry only controls visibility through its
-    allow list and exposes an ``invoke`` facade. Tests may build a registry
-    with a hand-written local source to avoid touching the RAG service.
-    """
-
+def create_rag_tool_registry(service: "RAGService") -> ToolRegistry:
+    """创建一个包含检索和引用工具的注册表。"""
     local = LocalToolSource()
 
     def retrieve_knowledge(
@@ -281,9 +226,13 @@ def create_rag_tool_registry(service: RAGService) -> ToolRegistry:
 
         query = str(arguments.get("query", "")).strip()
         if not query:
-            raise ValidationError("list_sources requires a non-empty query.")
+            raise ValidationError("list_sources 需要非空的 query 参数。")
         result = service.retrieve_only(
-            AnswerRequest(question=query, tenant_id=context.tenant_id, owner_id=context.owner_id)
+            AnswerRequest(
+                question=query,
+                tenant_id=context.tenant_id,
+                owner_id=context.owner_id,
+            )
         )
         return {"sources": result.distinct_sources(), "count": len(result.documents)}
 
@@ -292,7 +241,7 @@ def create_rag_tool_registry(service: RAGService) -> ToolRegistry:
     ) -> dict[str, typing.Any]:
         evidence = arguments.get("documents") or []
         if not isinstance(evidence, list):
-            raise ValidationError("summarize_citations expects a documents array.")
+            raise ValidationError("summarize_citations 需要 documents 数组。")
         citations: list[dict[str, typing.Any]] = []
         for index, document in enumerate(evidence, start=1):
             if not isinstance(document, dict):
@@ -337,9 +286,7 @@ def create_rag_tool_registry(service: RAGService) -> ToolRegistry:
             "description": "列出当前问题命中的知识库来源。",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "检索问题"},
-                },
+                "properties": {"query": {"type": "string", "description": "检索问题"}},
                 "required": ["query"],
             },
         },
@@ -362,47 +309,38 @@ def create_rag_tool_registry(service: RAGService) -> ToolRegistry:
             },
         },
     )
-    # ``None`` means "allow every tool contributed by the source". This factory's
-    # contract is to expose the built-in RAG tools by default; callers that need a
-    # restricted set should construct their own registry or call ``set_allowed``
-    # afterwards. An explicit empty sequence would mean "allow nothing", which is
-    # never what the default registry wants.
     return ToolRegistry(sources=[local], allowed_tools=None)
 
 
-# ---------------------------------------------------------------------------
-# Guardrails
-# ---------------------------------------------------------------------------
-
-
 class Guardrails:
-    """Enforce iteration, tool, injection, and question-length safety rules."""
+    """强制执行迭代、工具、注入和问题长度的安全规则。"""
 
     def __init__(
         self,
-        settings: GuardrailsSettings | typing.Any,
+        guardrails_settings: "GuardrailsSettings",
         agent_settings: typing.Any | None = None,
     ) -> None:
-        self._guardrails_settings = settings
+        self._guardrails_settings = guardrails_settings
         self._agent_settings = agent_settings
 
     @property
-    def _settings(self) -> typing.Any:
-        """Backward-compatible accessor: prefer agent_settings for budget fields."""
-
-        return self._agent_settings if self._agent_settings is not None else self._guardrails_settings
+    def budget_settings(self) -> typing.Any:
+        """预算相关的设置优先从 agent_settings 获取。"""
+        return (
+            self._agent_settings
+            if self._agent_settings is not None
+            else self._guardrails_settings
+        )
 
     def check_question(self, question: str) -> str:
-        """Sanitize the question and reject obvious prompt injection."""
-
+        """清理问题并拒绝明显的提示词注入。"""
         if not isinstance(question, str) or not question.strip():
-            raise ValidationError("Question must not be empty.")
+            raise ValidationError("问题不能为空。")
 
         normalized = question.strip()
-        if len(normalized) > self._max_question_length():
-            raise ValidationError(
-                f"Question exceeds maximum length of {self._max_question_length()} characters."
-            )
+        max_len = self._max_question_length()
+        if len(normalized) > max_len:
+            raise ValidationError(f"问题长度超出了 {max_len} 字符的最大限制。")
 
         action = self._injection_action()
         if self._contains_injection(normalized):
@@ -412,59 +350,46 @@ class Guardrails:
                     details={"rule": "prompt_injection"},
                 )
             if action == "log":
-                logger.warning("Prompt injection pattern detected (logged only).")
-            # "sanitize" continues after stripping matched patterns.
+                logger.warning("检测到提示词注入模式（仅记录）。")
             for pattern in _INJECTION_PATTERNS:
                 normalized = pattern.sub("", normalized).strip()
         return normalized
 
     def check_iteration(self, iteration: int) -> None:
-        """Raise when the agent exceeds its configured iteration budget."""
-
-        maximum = self._settings.max_iterations
+        """当智能体超出配置的迭代预算时抛出异常。"""
+        maximum = self.budget_settings.max_iterations
         if iteration > maximum:
             raise AgentBudgetExceeded(
-                f"Agent exceeded maximum iteration count: {maximum}.",
+                f"智能体超出了最大迭代次数：{maximum}。",
                 details={"max_iterations": maximum, "iteration": iteration},
             )
 
     def check_tool_calls(self, count: int) -> None:
-        """Raise when the agent calls too many tools."""
-
-        maximum = self._settings.max_tool_calls
+        """当智能体调用工具次数过多时抛出异常。"""
+        maximum = self.budget_settings.max_tool_calls
         if count > maximum:
             raise AgentBudgetExceeded(
-                f"Agent exceeded maximum tool calls: {maximum}.",
+                f"智能体超出了最大工具调用次数：{maximum}。",
                 details={"max_tool_calls": maximum, "count": count},
             )
 
     def validate_tool_call(self, name: str, registry: ToolRegistry) -> None:
-        """Ensure the requested tool exists and is allowed."""
-
+        """确保请求的工具存在且被允许。"""
         if not registry.has(name):
             raise PermissionDeniedError(
-                f"Tool {name!r} is not registered or not permitted.",
+                f"工具 {name!r} 未注册或未被允许。",
                 details={"allowed_tools": registry.allowed_names()},
             )
 
     def _max_question_length(self) -> int:
-        configured = getattr(self._settings, "max_question_length", 0)
+        configured = getattr(self._guardrails_settings, "max_question_length", 0)
         return configured or 2000
 
     def _injection_action(self) -> str:
-        return getattr(self._settings, "prompt_injection_action", "reject")
+        return getattr(self._guardrails_settings, "prompt_injection_action", "reject")
 
     def _contains_injection(self, text: str) -> bool:
         return any(pattern.search(text) for pattern in _INJECTION_PATTERNS)
-
-
-class AgentBudgetExceeded(RuntimeError):
-    """Raised when an agent exceeds its execution budget."""
-
-    def __init__(self, message: str, *, details: dict[str, typing.Any] | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.details = dict(details or {})
 
 
 def _document_summary(document: typing.Any) -> dict[str, typing.Any]:
@@ -487,20 +412,10 @@ def _snippet(text: str, limit: int = 240) -> str:
     return cleaned[:limit] + ("…" if len(cleaned) > limit else "")
 
 
-# Lazy import avoids a hard dependency on the (optional) ``mcp`` package at
-# collection time: users who never enable MCP should not pay for its import.
-def __getattr__(name: str):
-    if name == "MCPToolSource":
-        module = importlib.import_module("src.rag.tool_sources")
-        return getattr(module, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 __all__ = [
     "AgentBudgetExceeded",
     "Guardrails",
     "LocalToolSource",
-    "MCPToolSource",
     "ToolCallRecord",
     "ToolContext",
     "ToolHandler",

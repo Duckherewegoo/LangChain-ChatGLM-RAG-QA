@@ -1,12 +1,13 @@
-"""Agent execution events and audit trails.
+"""智能体执行事件与审计轨迹。
 
-Every graph transition, tool invocation, model call, and final answer is
-represented as an immutable event. Events are safe to serialize and retain
-enough context for review without exposing raw tool payloads or credentials.
+每一次图状态转移、工具调用、模型调用和最终回答都被表示为一个不可变事件。
+事件可以安全地序列化，并保留了足够的上下文以供审查，同时不会暴露原始的工具负载或凭证。
 """
 
 from __future__ import annotations
 
+import enum
+import json
 import time
 import typing
 import uuid
@@ -14,8 +15,8 @@ import uuid
 from pydantic import BaseModel, Field
 
 
-class AgentEventType(str):
-    """Stable event category identifiers."""
+class AgentEventType(str, enum.Enum):
+    """稳定的事件类别标识符。"""
 
     STARTED = "agent.started"
     ITERATION_STARTED = "agent.iteration.started"
@@ -39,7 +40,9 @@ class AgentEventType(str):
 
 
 class AgentEvent(BaseModel):
-    """A single auditable event emitted during agent execution."""
+    """智能体执行期间发出的单条可审计事件。"""
+
+    model_config = {"frozen": True}  # 强制不可变
 
     event_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     event_type: str
@@ -57,8 +60,7 @@ class AgentEvent(BaseModel):
     retryable: bool = False
 
     def for_audit(self) -> dict[str, typing.Any]:
-        """Return a JSON-safe copy with redacted sensitive fields."""
-
+        """返回一个脱敏后的 JSON 安全字典。"""
         redacted = _redact(dict(self.data or {}))
         return {
             "event_id": self.event_id,
@@ -79,45 +81,54 @@ class AgentEvent(BaseModel):
 
 
 class AgentAuditTrail(BaseModel):
-    """Ordered, immutable sequence of agent events."""
+    """有序的智能体事件序列。"""
 
     request_id: str
     events: list[AgentEvent] = Field(default_factory=list)
     started_at: float = Field(default_factory=time.time)
     completed_at: float | None = None
+    
+    # 内部监听器列表，不参与序列化
+    _listeners: list[AgentEventListener] = []
+
+    def add_listener(self, listener: "AgentEventListener") -> None:
+        """注册事件监听器。"""
+        if listener not in self._listeners:
+            self._listeners.append(listener)
 
     def record(self, event: AgentEvent) -> None:
-        """Append an event; the trail remains the only event history."""
-
+        """追加事件，并通知所有已注册的监听器。"""
         self.events.append(event)
+        for listener in self._listeners:
+            try:
+                listener.on_event(event)
+            except Exception:
+                # 监听器报错不应阻断主业务流程
+                pass
 
     def record_now(self, **fields: typing.Any) -> AgentEvent:
-        """Create, append, and return an event."""
-
+        """创建、追加并返回一个事件。"""
         event = AgentEvent(request_id=self.request_id, **fields)
         self.record(event)
         return event
 
     def complete(self) -> None:
-        """Mark the trail as completed."""
-
+        """将轨迹标记为已完成。"""
         self.completed_at = time.time()
 
     def duration_seconds(self) -> float | None:
-        """Return total elapsed time when the trail is complete."""
-
+        """当轨迹完成时返回总耗时。"""
         if self.completed_at is None:
             return None
         return max(0.0, self.completed_at - self.started_at)
 
     def summarize(self) -> dict[str, typing.Any]:
-        """Return a compact summary suitable for API responses."""
-
+        """返回适合 API 响应的紧凑摘要。"""
         models = _collect_unique(self.events, "model")
         providers = _collect_unique(self.events, "provider")
         tools = _collect_unique(self.events, "tool")
         failures = [event for event in self.events if event.status == "error"]
-        fallback_events = [event for event in self.events if event.event_type == AgentEventType.MODEL_FALLBACK]
+        fallback_events = [event for event in self.events if event.event_type == AgentEventType.MODEL_FALLBACK.value]
         return {
             "request_id": self.request_id,
             "event_count": len(self.events),
@@ -134,24 +145,22 @@ class AgentAuditTrail(BaseModel):
         }
 
     def to_jsonl(self) -> str:
-        """Serialize every event as JSON Lines."""
-
+        """将每一个事件序列化为 JSON Lines。"""
         return "\n".join(
-            __import__("json").dumps(event.for_audit(), ensure_ascii=False) for event in self.events
+            json.dumps(event.for_audit(), ensure_ascii=False) for event in self.events
         )
 
 
 class AgentEventListener:
-    """Observer interface for agent trails."""
+    """智能体轨迹的观察者接口。"""
 
     def on_event(self, event: AgentEvent) -> None:
-        """Handle an emitted event."""
-
+        """处理被发出的事件。"""
         raise NotImplementedError
 
 
 class LoggingAgentEventListener(AgentEventListener):
-    """Persist events through the structured logger."""
+    """通过标准日志记录器持久化事件。"""
 
     def __init__(self, logger: typing.Any, *, only_types: typing.Iterable[str] | None = None) -> None:
         self._logger = logger
@@ -160,8 +169,11 @@ class LoggingAgentEventListener(AgentEventListener):
     def on_event(self, event: AgentEvent) -> None:
         if self._only and event.event_type not in self._only:
             return
-        log = self._logger.bind(request_id=event.request_id, event_type=event.event_type)
-        log.info("agent_event", **event.for_audit())
+        
+        # 兼容标准 logging 库，使用 extra 传递结构化字段
+        extra_info = event.for_audit()
+        self._logger.info(
+            f"agent_event | type={event.event_type} | node={event.node or 'N/A'}", agent_event=extra_info)
 
 
 def _redact(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:

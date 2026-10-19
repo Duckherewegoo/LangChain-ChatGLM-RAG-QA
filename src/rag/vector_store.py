@@ -1,26 +1,29 @@
-"""Vector store abstraction and ChromaDB-backed implementation."""
+"""向量存储抽象与 ChromaDB 实现。"""
 
 from __future__ import annotations
 
+import abc
+import logging
 import os
 import threading
 import typing
 
 from pydantic import BaseModel, Field
 
-from src.rag.collection_policy import CollectionCompatibilityError
+from src.exceptions import CollectionCompatibilityError
 
-if typing.TYPE_CHECKING:  # pragma: no cover - type checking only
+if typing.TYPE_CHECKING:  # 仅用于类型检查
     from collections.abc import Sequence
 
     from chromadb.api import ClientAPI
+
+logger = logging.getLogger(__name__)
 
 _REGISTRY: dict[str, type[VectorStore]] = {}
 
 
 class VectorRecord(BaseModel):
-    """A document chunk and its metadata ready for persistence."""
-
+    """准备持久化的文档块及其元数据。"""
     document_id: str
     chunk_id: str
     text: str
@@ -34,20 +37,20 @@ class VectorRecord(BaseModel):
 
 
 class SearchResult(BaseModel):
-    """A scored search result."""
-
+    """带分数的搜索结果。"""
     record: VectorRecord
     score: float
 
 
-class VectorStore:
-    """Vector store protocol used by the retrieval pipeline."""
+class VectorStore(abc.ABC):
+    """检索管线使用的向量存储协议。"""
 
+    @abc.abstractmethod
     def add(self, records: Sequence[VectorRecord], embeddings: Sequence[Sequence[float]]) -> int:
-        """Persist records and return the number added."""
+        """持久化记录并返回添加的数量。"""
+        ...
 
-        raise NotImplementedError
-
+    @abc.abstractmethod
     def search(
         self,
         query_embedding: Sequence[float],
@@ -56,59 +59,51 @@ class VectorStore:
         top_k: int = 8,
         allowed_sources: Sequence[str] | None = None,
     ) -> list[SearchResult]:
-        """Return the top candidates for a query embedding."""
+        """返回查询向量的前 top_k 个候选。"""
+        ...
 
-        raise NotImplementedError
-
+    @abc.abstractmethod
     def delete_by_document(self, document_id: str, tenant_id: str = "default") -> int:
-        """Delete chunks belonging to a document."""
+        """删除属于某文档的所有块。"""
+        ...
 
-        raise NotImplementedError
-
+    @abc.abstractmethod
     def count(self, tenant_id: str = "default") -> int:
-        """Return the number of persisted chunks."""
+        """返回持久化的块数量。"""
+        ...
 
-        raise NotImplementedError
-
+    @abc.abstractmethod
     def dimension(self) -> int | None:
-        """Return the embedding dimension stored in the collection, if known."""
+        """返回集合中存储的向量维度（若已知）。"""
+        ...
 
-        raise NotImplementedError
-
+    @abc.abstractmethod
     def describe(self) -> dict[str, typing.Any]:
-        """Return store-level metadata for diagnostics."""
-
-        raise NotImplementedError
+        """返回用于诊断的存储级元数据。"""
+        ...
 
     def close(self) -> None:
-        """Release resources held by the store."""
-
+        """释放存储持有的资源。"""
         return
 
 
 def register_vector_store(name: str, store_type: type[VectorStore]) -> None:
-    """Register a vector store implementation."""
-
+    """注册一个向量存储实现。"""
     _REGISTRY[name.strip().lower()] = store_type
 
 
 def create_vector_store(store_type: str, **options: typing.Any) -> VectorStore:
-    """Create a vector store by registered type name."""
-
+    """按注册的类型名称创建向量存储。"""
     implementation = _REGISTRY.get(store_type.strip().lower())
     if implementation is None:
         raise ValueError(
-            f"Unsupported vector store type: {store_type!r}; available={sorted(_REGISTRY)}"
+            f"不支持的向量存储类型: {store_type!r}; 可用类型={sorted(_REGISTRY)}"
         )
     return implementation(**options)
 
 
 class ChromaVectorStore(VectorStore):
-    """Persistent ChromaDB-backed vector store.
-
-    ChromaDB is created through its standard Python API; this wrapper only
-    standardizes tenant filtering, metadata serialization, and result mapping.
-    """
+    """持久化的 ChromaDB 向量存储。"""
 
     def __init__(
         self,
@@ -173,7 +168,7 @@ class ChromaVectorStore(VectorStore):
 
     def add(self, records: Sequence[VectorRecord], embeddings: Sequence[Sequence[float]]) -> int:
         if len(records) != len(embeddings):
-            raise ValueError("records and embeddings must have the same length.")
+            raise ValueError("records 和 embeddings 长度必须相同。")
 
         collection = self._get_collection()
         dimension = len(embeddings[0]) if embeddings else 0
@@ -183,9 +178,9 @@ class ChromaVectorStore(VectorStore):
         metadatas: list[dict[str, typing.Any]] = []
         embedded: list[list[float]] = []
 
-        for record, vector in zip(records, embeddings, strict=False):
+        for record, vector in zip(records, embeddings, strict=True):
             if len(vector) != dimension:
-                raise ValueError("All embeddings must share the same dimension.")
+                raise ValueError("所有 embeddings 必须具有相同的维度。")
             ids.append(self._record_id(record.tenant_id, record.chunk_id))
             documents.append(record.text)
             metadatas.append(self._serialize_metadata(record))
@@ -204,8 +199,8 @@ class ChromaVectorStore(VectorStore):
 
     def _assert_dimension_compatibility(self, dimension: int) -> None:
         if self._known_dimension is not None and self._known_dimension != dimension:
-            raise CollectionCompatibilityError(  # type: ignore[name-defined]
-                "Cannot write embeddings with a different dimension than the existing collection.",
+            raise CollectionCompatibilityError(
+                "无法写入与现有集合维度不同的 embeddings。",
                 details={
                     "collection": self._collection_name,
                     "stored_dimension": self._known_dimension,
@@ -218,9 +213,7 @@ class ChromaVectorStore(VectorStore):
             collection = self._get_collection()
             collection.modify(metadata={**(collection.metadata or {}), "dimension": dimension})
         except Exception as exc:
-            import logging
-
-            logging.getLogger(__name__).warning("Failed to persist collection dimension: %s", exc)
+            logger.warning(f"持久化集合维度失败: {exc}")
 
     def search(
         self,
@@ -234,14 +227,22 @@ class ChromaVectorStore(VectorStore):
             return []
 
         collection = self._get_collection()
-        where = {"tenant_id": tenant_id}
+
+        # 修复：ChromaDB 对多个过滤条件必须使用 $and 包裹
         if allowed_sources:
-            where["source"] = {"$in": [str(item) for item in allowed_sources]}
+            where_clause = {
+                "$and": [
+                    {"tenant_id": tenant_id},
+                    {"source": {"$in": [str(item) for item in allowed_sources]}}
+                ]
+            }
+        else:
+            where_clause = {"tenant_id": tenant_id}
 
         response = collection.query(
             query_embeddings=[[float(value) for value in query_embedding]],
             n_results=top_k,
-            where=where,
+            where=where_clause,
         )
 
         ids = (response.get("ids") or [[]])[0]
@@ -263,8 +264,9 @@ class ChromaVectorStore(VectorStore):
 
     def delete_by_document(self, document_id: str, tenant_id: str = "default") -> int:
         collection = self._get_collection()
+        # 修复：查条件删记录时，不应该传空 ids=[]
         existing = collection.get(
-            ids=[], where={"$and": [{"tenant_id": tenant_id}, {"document_id": document_id}]}
+            where={"$and": [{"tenant_id": tenant_id}, {"document_id": document_id}]}
         )
         target_ids = existing.get("ids") or []
         if not target_ids:
@@ -274,8 +276,7 @@ class ChromaVectorStore(VectorStore):
 
     def count(self, tenant_id: str = "default") -> int:
         collection = self._get_collection()
-        result = collection.count()
-        return int(result)
+        return int(collection.count())
 
     def close(self) -> None:
         self._collection = None
@@ -327,7 +328,22 @@ class ChromaVectorStore(VectorStore):
     ) -> VectorRecord:
         tags_raw = metadata.get("tags")
         tags = [tag for tag in str(tags_raw).split(",") if tag] if isinstance(tags_raw, str) else []
+
+        # 修复：使用异常捕获安全解析 page，防止 numpy 类型导致丢失
         page_value = metadata.get("page")
+        page = None
+        try:
+            if page_value is not None:
+                page_num = int(page_value)
+                if page_num > 0:
+                    page = page_num
+        except (ValueError, TypeError):
+            pass
+
+        # 修复：把非核心字段塞回 metadata
+        core_keys = {"document_id", "chunk_id", "source", "title", "tenant_id", "page", "owner_id", "tags"}
+        extra_metadata = {k: v for k, v in metadata.items() if k not in core_keys}
+
         return VectorRecord(
             document_id=str(metadata.get("document_id", "")),
             chunk_id=str(metadata.get("chunk_id", identifier)),
@@ -336,8 +352,9 @@ class ChromaVectorStore(VectorStore):
             source=str(metadata.get("source", "")),
             tenant_id=str(metadata.get("tenant_id", "default")),
             owner_id=metadata.get("owner_id"),
-            page=int(page_value) if isinstance(page_value, int | float) and page_value > 0 else None,
+            page=page,
             tags=tags,
+            metadata=extra_metadata,
         )
 
     @staticmethod

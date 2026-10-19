@@ -1,17 +1,19 @@
-"""Retrieval pipeline: vector search, authorization filtering, and reranking."""
+"""检索管线：向量检索、权限过滤与重排序。"""
 
 from __future__ import annotations
 
 import typing
+from contextlib import nullcontext
 
 from pydantic import BaseModel
 
 from src.exceptions import RetrievalError
-from src.observability import RERANK_LATENCY, RETRIEVAL_DOCUMENTS, get_logger
+from src.model.embedding import EmbeddingModel
+from src.observability import get_logger, get_metric
 from src.rag.reranker import Reranker, create_reranker
 from src.rag.types import RetrievedContext, RetrievedDocument
 
-if typing.TYPE_CHECKING:
+if typing.TYPE_CHECKING:  # 仅用于类型检查
     from src.rag.vector_store import VectorStore
     from src.settings import RetrievalSettings
 
@@ -19,7 +21,7 @@ logger = get_logger(__name__)
 
 
 class RetrievedEvidence(BaseModel):
-    """Internal evidence DTO passed between retrieval and answer construction."""
+    """在检索与答案构建之间传递的内部证据数据对象。"""
 
     document: RetrievedDocument
     vector_score: float
@@ -27,12 +29,12 @@ class RetrievedEvidence(BaseModel):
 
 
 class RetrievalPipeline:
-    """Coordinates vector retrieval and reranking into a typed context."""
+    """将向量检索与重排协调为带类型的检索上下文。"""
 
     def __init__(
         self,
         vector_store: VectorStore,
-        embedder: typing.Any,
+        embedder: EmbeddingModel,
         settings: RetrievalSettings,
         reranker: Reranker | None = None,
     ) -> None:
@@ -56,10 +58,9 @@ class RetrievalPipeline:
         allowed_sources: typing.Sequence[str] | None = None,
         owner_id: str | None = None,
     ) -> RetrievedContext:
-        """Return authorized, reranked evidence for a query."""
-
+        """返回授权且重排后的检索证据。"""
         if not query.strip():
-            raise ValueError("Retrieval query must not be empty.")
+            raise ValueError("检索查询不能为空。")
 
         limit = max(1, top_k or self._settings.top_k)
         fetch_k = limit * max(1, self._settings.fetch_multiplier)
@@ -73,7 +74,7 @@ class RetrievalPipeline:
                 allowed_sources=allowed_sources,
             )
         except Exception as exc:
-            raise RetrievalError(f"Vector retrieval failed: {exc}") from exc
+            raise RetrievalError(f"向量检索失败: {exc}") from exc
 
         evidence = [
             RetrievedEvidence(
@@ -84,11 +85,12 @@ class RetrievalPipeline:
             if self._is_authorized(candidate.record, owner_id)
         ]
 
-        if RETRIEVAL_DOCUMENTS:
-            RETRIEVAL_DOCUMENTS.labels(tenant_id=tenant_id).observe(len(evidence))
+        retrieval_documents = get_metric("retrieval_documents")
+        if retrieval_documents is not None:
+            retrieval_documents.labels(tenant_id=tenant_id).observe(len(evidence))
 
         if not evidence:
-            logger.info("retrieval_empty", extra={"query_length": len(query), "tenant_id": tenant_id})
+            logger.info(f"检索为空 | query_len={len(query)} | tenant_id={tenant_id}")
             return RetrievedContext(query=query, documents=[], search_type="vector")
 
         if self._settings.rerank.enabled:
@@ -97,55 +99,67 @@ class RetrievalPipeline:
         documents = self._to_context_documents(evidence[:limit])
         context = RetrievedContext(query=query, documents=documents, search_type="vector")
         logger.info(
-            "retrieval_completed",
-            tenant_id=tenant_id,
-            candidates=fetch_k,
-            retrieved=len(documents),
-            reranked=self._settings.rerank.enabled,
+            f"检索完成 | tenant_id={tenant_id} | candidates={fetch_k} | "
+            f"retrieved={len(documents)} | reranked={self._settings.rerank.enabled}"
         )
         return context
 
-    def _apply_reranking(self, query: str, evidence: list[RetrievedEvidence]) -> list[RetrievedEvidence]:
-        with RERANK_LATENCY.time() if RERANK_LATENCY else _nullcontext():
+    def _apply_reranking(
+        self, query: str, evidence: list[RetrievedEvidence]
+    ) -> list[RetrievedEvidence]:
+        """应用交叉编码器重排，并合并原始向量分数。"""
+        rerank_latency = get_metric("rerank_latency")
+        context = rerank_latency.time() if rerank_latency else nullcontext()
+        with context:
             results = self._reranker.rerank(
                 query, [entry.document for entry in evidence], top_k=len(evidence)
             )
 
+        evidence_map = {entry.document.chunk_id: entry for entry in evidence}
         reranked: list[RetrievedEvidence] = []
+
         for result in results:
-            for entry in evidence:
-                if entry.document.chunk_id == result.document.chunk_id:
-                    reranked.append(
-                        RetrievedEvidence(
-                            document=entry.document,
-                            vector_score=entry.vector_score,
-                            rerank_score=result.score,
-                        )
+            entry = evidence_map.get(result.document.chunk_id)
+            if entry:
+                reranked.append(
+                    RetrievedEvidence(
+                        document=entry.document,
+                        vector_score=entry.vector_score,
+                        rerank_score=result.score,
                     )
-                    break
-        reranked.sort(key=lambda item: item.rerank_score or item.vector_score, reverse=True)
+                )
+
+        reranked.sort(
+            key=lambda item: (
+                item.rerank_score
+                if item.rerank_score is not None
+                else item.vector_score
+            ),
+            reverse=True,
+        )
         return reranked
 
     def _to_context_documents(
         self, evidence: typing.Sequence[RetrievedEvidence]
     ) -> list[RetrievedDocument]:
+        """将内部证据转换为对外的检索文档列表。"""
         documents: list[RetrievedDocument] = []
         for entry in evidence:
-            base = entry.document.model_dump()
-            base.pop("rerank_score", None)
             documents.append(
-                RetrievedDocument(
-                    rerank_score=entry.rerank_score,
-                    **base,
-                )
+                entry.document.model_copy(update={"rerank_score": entry.rerank_score})
             )
         return documents
 
     @staticmethod
     def _is_authorized(record: typing.Any, owner_id: str | None) -> bool:
-        if owner_id and getattr(record, "owner_id", None):
-            return record.owner_id == owner_id
-        return True
+        """判断文档是否对当前主体可见。
+
+        一旦指定 owner_id，只返回 owner_id 严格匹配的文档；
+        None 不视为通配。未指定 owner_id 时不做归属过滤（由上游负责租户隔离）。
+        """
+        if owner_id is None:
+            return True
+        return getattr(record, "owner_id", None) == owner_id
 
     @staticmethod
     def _to_document(record: typing.Any, score: float) -> RetrievedDocument:
@@ -161,14 +175,6 @@ class RetrievalPipeline:
             tags=list(record.tags or []),
             metadata=dict(record.metadata or {}),
         )
-
-
-class _nullcontext:
-    def __enter__(self) -> _nullcontext:
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        return None
 
 
 __all__ = ["RetrievalPipeline", "RetrievedEvidence"]

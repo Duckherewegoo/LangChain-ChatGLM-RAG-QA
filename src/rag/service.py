@@ -1,10 +1,8 @@
-"""High-level RAG service coordinating retrieval, prompt building, and generation.
+"""协调检索、提示词构建和生成的高层 RAG 服务。
 
-This module owns retrieval-first answer construction. Model selection and
-fallback execution are delegated to :class:`FallbackExecutor`; this module never
-imports provider SDKs or catches model exceptions silently. When the executor
-fails over, it records which models participated so the response remains
-auditable.
+本模块负责“检索优先”的答案构建。模型选择与回退执行委托给 FallbackExecutor；
+本模块绝不直接导入提供者 SDK，也不会静默捕获模型异常。当执行器发生回退时，
+它会记录参与的模型，以便审计响应。
 """
 
 from __future__ import annotations
@@ -13,11 +11,11 @@ import typing
 
 from pydantic import BaseModel, Field
 
-from src.exceptions import RetrievalError, ValidationError
-from src.model import ChatModel, ChatRequest, ChatResponse, FallbackExecutor
+from src.exceptions import ModelInvocationError, RetrievalError, ValidationError
+from src.model import ChatModel, ChatRequest, ChatResponse, FallbackExecutor, FallbackResult
 from src.observability import get_logger
 
-if typing.TYPE_CHECKING:
+if typing.TYPE_CHECKING:  # 仅用于类型检查
     from src.model.embedding import EmbeddingModel
     from src.rag.agent_events import AgentAuditTrail
     from src.rag.retrieval import RetrievalPipeline
@@ -31,7 +29,7 @@ _SYSTEM_PROMPT = """你是企业级知识库智能助手。仅基于提供的上
 
 
 class AnswerRequest(BaseModel):
-    """End-user answer request."""
+    """终端用户的回答请求。"""
 
     question: str = Field(..., min_length=1)
     tenant_id: str = "default"
@@ -44,7 +42,7 @@ class AnswerRequest(BaseModel):
 
 
 class Citation(BaseModel):
-    """A source referenced by the generated answer."""
+    """生成的答案所引用的来源。"""
 
     index: int
     source: str
@@ -54,7 +52,7 @@ class Citation(BaseModel):
 
 
 class AnswerResult(BaseModel):
-    """Final answer together with evidence and execution metadata."""
+    """最终答案及其证据与执行元数据。"""
 
     answer: str
     query: str
@@ -67,8 +65,14 @@ class AnswerResult(BaseModel):
     fallback_used: bool = False
 
 
+class ModelExecutionFailed(ModelInvocationError):
+    """当回退链中的所有模型均失败时抛出。"""
+    status_code = 502
+    error_code = "model_execution_failed"
+
+
 class RAGService:
-    """Production-style retrieval-augmented generation service."""
+    """生产级检索增强生成服务。"""
 
     def __init__(
         self,
@@ -87,48 +91,29 @@ class RAGService:
         self._guardrails = guardrails
 
     def answer(self, request: AnswerRequest) -> AnswerResult:
-        """Run a retrieval-first direct answer."""
-
+        """执行一次检索优先的直接回答。"""
         self._validate_request(request)
         context = self._retrieve(request)
         prompt_messages = self._build_prompt(request.question, context, request.history)
-        response = self._generate(ChatRequest(messages=prompt_messages), request)
-        return AnswerResult(
-            answer=response.content,
-            query=request.question,
-            context=context,
-            citations=self._build_citations(context),
-            context_used=not context.is_empty(),
-            model=response.model,
-            tokens={
-                "prompt_tokens": response.prompt_tokens,
-                "completion_tokens": response.completion_tokens,
-            },
-            attempted_models=self._executor.providers,
-            fallback_used=self._was_fallback(response),
-        )
+
+        result = self._executor.invoke(ChatRequest(messages=prompt_messages))
+        response = self._ensure_success(result, request.use_case)
+
+        return self._build_answer_result(request, context, response, result)
 
     async def aanswer(self, request: AnswerRequest) -> AnswerResult:
+        """异步执行一次检索优先的直接回答。"""
         self._validate_request(request)
         context = self._retrieve(request)
         prompt_messages = self._build_prompt(request.question, context, request.history)
-        response = await self._generate_async(ChatRequest(messages=prompt_messages), request)
-        return AnswerResult(
-            answer=response.content,
-            query=request.question,
-            context=context,
-            citations=self._build_citations(context),
-            context_used=not context.is_empty(),
-            model=response.model,
-            tokens={
-                "prompt_tokens": response.prompt_tokens,
-                "completion_tokens": response.completion_tokens,
-            },
-            attempted_models=self._executor.providers,
-            fallback_used=self._was_fallback(response),
-        )
+
+        result = await self._executor.ainvoke(ChatRequest(messages=prompt_messages))
+        response = self._ensure_success(result, request.use_case)
+
+        return self._build_answer_result(request, context, response, result)
 
     def retrieve_only(self, request: AnswerRequest) -> RetrievedContext:
+        """仅执行检索，不调用模型生成。"""
         self._validate_request(request)
         return self._retrieve(request)
 
@@ -144,30 +129,45 @@ class RAGService:
         except RetrievalError:
             raise
         except Exception as exc:
-            raise RetrievalError(f"Knowledge retrieval failed: {exc}") from exc
+            raise RetrievalError(f"知识检索失败: {exc}") from exc
 
-    def _generate(self, request: ChatRequest, original: AnswerRequest) -> ChatResponse:
-        result = self._executor.invoke(request)
+    def _ensure_success(self, result: FallbackResult, use_case: str) -> ChatResponse:
+        """校验执行结果，如果全部失败则抛出异常。"""
         if result.succeeded and result.response is not None:
             return result.response
+
         raise ModelExecutionFailed(
-            "All configured chat models failed to generate a response.",
+            "所有配置的对话模型均无法生成响应。",
             details={
                 "attempts": [attempt.model_dump() for attempt in result.attempts],
-                "use_case": original.use_case,
+                "use_case": use_case,
             },
         )
 
-    async def _generate_async(self, request: ChatRequest, original: AnswerRequest) -> ChatResponse:
-        result = await self._executor.ainvoke(request)
-        if result.succeeded and result.response is not None:
-            return result.response
-        raise ModelExecutionFailed(
-            "All configured chat models failed to generate a response.",
-            details={
-                "attempts": [attempt.model_dump() for attempt in result.attempts],
-                "use_case": original.use_case,
+    def _build_answer_result(
+        self,
+        request: AnswerRequest,
+        context: RetrievedContext,
+        response: ChatResponse,
+        result: FallbackResult,
+    ) -> AnswerResult:
+        """统一构建最终响应对象。"""
+        # 正确判断是否触发回退：成功的尝试不是第一个，或者尝试次数大于1且发生了失败
+        fallback_used = len(result.attempts) > 1
+
+        return AnswerResult(
+            answer=response.content,
+            query=request.question,
+            context=context,
+            citations=self._build_citations(context),
+            context_used=not context.is_empty(),
+            model=response.model,
+            tokens={
+                "prompt_tokens": response.prompt_tokens,
+                "completion_tokens": response.completion_tokens,
             },
+            attempted_models=self._executor.providers,
+            fallback_used=fallback_used,
         )
 
     def _build_prompt(
@@ -175,11 +175,13 @@ class RAGService:
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [{"role": "system", "content": _SYSTEM_PROMPT}]
         history_limit = max(0, self._guardrails.max_history_messages)
+
         for entry in history[-history_limit:]:
             role = entry.get("role")
             if role not in {"user", "assistant"}:
                 continue
             messages.append({"role": role, "content": entry.get("content", "")})
+
         if not context.is_empty():
             messages.append(
                 {
@@ -192,30 +194,24 @@ class RAGService:
 
     @staticmethod
     def _build_citations(context: RetrievedContext) -> list[Citation]:
-        citations: list[Citation] = []
-        for index, document in enumerate(context.documents, start=1):
-            citations.append(
-                Citation(
-                    index=index,
-                    source=document.source,
-                    title=document.title,
-                    page=document.page,
-                    chunk_id=document.chunk_id,
-                )
+        return [
+            Citation(
+                index=index,
+                source=document.source,
+                title=document.title,
+                page=document.page,
+                chunk_id=document.chunk_id,
             )
-        return citations
+            for index, document in enumerate(context.documents, start=1)
+        ]
 
     def _validate_request(self, request: AnswerRequest) -> None:
         question = (request.question or "").strip()
         if not question:
-            raise ValidationError("Question must not be empty.")
+            raise ValidationError("问题内容不能为空。")
         limit = getattr(self._guardrails, "max_question_length", 0) or 2000
         if len(question) > limit:
-            raise ValidationError(f"Question exceeds maximum length of {limit} characters.")
-
-    @staticmethod
-    def _was_fallback(response: ChatResponse) -> bool:
-        return bool(response.provider)
+            raise ValidationError(f"问题长度超出了 {limit} 字符的最大限制。")
 
 
 def _format_context(context: RetrievedContext) -> str:
@@ -229,13 +225,6 @@ def _format_context(context: RetrievedContext) -> str:
     return "\n\n".join(blocks)
 
 
-class ModelExecutionFailed(RetrievalError):
-    """Raised when every model in the fallback chain fails."""
-
-    status_code = 502
-    error_code = "model_execution_failed"
-
-
 def build_answer_result_from_agent(
     answer: str,
     query: str,
@@ -245,8 +234,7 @@ def build_answer_result_from_agent(
     fallback_used: bool,
     trail: AgentAuditTrail,
 ) -> AnswerResult:
-    """Create an :class:`AnswerResult` from an agent execution outcome."""
-
+    """从智能体执行结果构建 AnswerResult。"""
     return AnswerResult(
         answer=answer,
         query=query,

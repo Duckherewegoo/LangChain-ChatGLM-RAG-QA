@@ -1,14 +1,14 @@
-"""LangGraph-based agent runtime.
+"""基于 LangGraph 的智能体运行时。
 
-The agent is intentionally constrained: it may only invoke registered tools,
-cannot exceed configured iteration and tool budgets, and must base its answer on
-retrieved evidence. Model selection and failover are delegated to
-:class:`FallbackExecutor`, while every transition, tool invocation, and model
-call is recorded in an :class:`AgentAuditTrail` for observability and review.
+该智能体被严格限制：只能调用已注册的工具，不能超出配置的迭代次数和工具调用预算，
+且必须基于检索到的证据进行回答。模型选择与故障转移被委托给 FallbackExecutor，
+而每一次状态转移、工具调用和模型调用都会被记录到 AgentAuditTrail 中，
+用于可观测性和审查。
 """
 
 from __future__ import annotations
 
+import json
 import time
 import typing
 import uuid
@@ -16,8 +16,8 @@ import uuid
 from pydantic import BaseModel, Field
 
 from src.exceptions import AgentExecutionError, RAGError, ValidationError
-from src.model import ChatRequest, ChatResponse, FallbackExecutor
-from src.observability import TOOL_CALLS_TOTAL, get_logger
+from src.model import ChatRequest, FallbackExecutor
+from src.observability import get_logger, get_metric
 from src.rag.agent_events import (
     AgentAuditTrail,
     AgentEventType,
@@ -26,8 +26,10 @@ from src.rag.agent_events import (
 from src.rag.retrieval import RetrievedContext
 from src.rag.service import AnswerRequest, AnswerResult, RAGService
 from src.rag.tools import Guardrails, ToolCallRecord, ToolRegistry
+from src.rag.tool_types import ToolContext
 
-if typing.TYPE_CHECKING:  # pragma: no cover - type checking only
+if typing.TYPE_CHECKING:
+    from src.model import ChatResponse
     from src.settings import AgentSettings, GuardrailsSettings
 
 logger = get_logger(__name__)
@@ -40,7 +42,7 @@ _SYSTEM_PROMPT = """你是企业知识库智能体。必须先通过已批准工
 
 
 class AgentRequest(BaseModel):
-    """User request accepted by the agent runtime."""
+    """智能体运行时接收的用户请求。"""
 
     question: str = Field(..., min_length=1)
     tenant_id: str = "default"
@@ -55,7 +57,7 @@ class AgentRequest(BaseModel):
 
 
 class AgentResponse(BaseModel):
-    """Structured agent outcome."""
+    """智能体结构化输出。"""
 
     request_id: str
     answer: str
@@ -67,12 +69,12 @@ class AgentResponse(BaseModel):
     documents: list[dict[str, typing.Any]] = Field(default_factory=list)
     attempted_models: list[str] = Field(default_factory=list)
     fallback_used: bool = False
-    trail: AgentAuditTrail = Field(default_factory=AgentAuditTrail)
+    trail: AgentAuditTrail = Field(default_factory=lambda: AgentAuditTrail(request_id=""))
     duration_seconds: float = 0.0
 
 
 class AgentDependencies:
-    """Dependencies required by the agent state machine."""
+    """智能体状态机所需的依赖项。"""
 
     def __init__(
         self,
@@ -92,7 +94,7 @@ class AgentDependencies:
 
 
 class AgentState(BaseModel):
-    """Mutable state exchanged between graph nodes."""
+    """图节点之间交换的可变状态。"""
 
     request_id: str = ""
     tenant_id: str = "default"
@@ -101,7 +103,7 @@ class AgentState(BaseModel):
     allowed_sources: list[str] = Field(default_factory=list)
     additional_context: str | None = None
     messages: list[dict[str, typing.Any]] = Field(default_factory=list)
-    trail: AgentAuditTrail = Field(default_factory=AgentAuditTrail)
+    trail: AgentAuditTrail = Field(default_factory=lambda: AgentAuditTrail(request_id=""))
     iterations: int = 0
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     citations: list[dict[str, typing.Any]] = Field(default_factory=list)
@@ -114,14 +116,12 @@ class AgentState(BaseModel):
     stopped_reason: str = "running"
 
     def next_iteration(self) -> int:
-        """Return the iteration number for the upcoming reasoning pass."""
-
+        """返回即将进行的推理轮次编号。"""
         return self.iterations + 1
 
 
 def build_agent(dependencies: AgentDependencies) -> typing.Any:
-    """Construct a compiled LangGraph state graph."""
-
+    """构建并编译 LangGraph 状态图。"""
     from langgraph.graph import END, StateGraph
 
     graph = StateGraph(AgentState)
@@ -143,7 +143,7 @@ def build_agent(dependencies: AgentDependencies) -> typing.Any:
 
 
 class _ReasonNode:
-    """Decide whether to call a tool or answer using the executor."""
+    """使用执行器决定是调用工具还是直接回答。"""
 
     def __init__(self, dependencies: AgentDependencies) -> None:
         self._dependencies = dependencies
@@ -166,6 +166,7 @@ class _ReasonNode:
 
         messages = _build_reasoning_messages(state)
         request = ChatRequest(messages=messages, tools=registry.list_tools())
+        
         response, used_fallback = _invoke_with_fallback(
             executor, registry, request, state, dependencies.agent_settings
         )
@@ -203,7 +204,7 @@ class _ReasonNode:
 
 
 class _ToolNode:
-    """Execute every tool requested by the model and persist evidence."""
+    """执行模型请求的每一个工具并持久化证据。"""
 
     def __init__(self, dependencies: AgentDependencies) -> None:
         self._dependencies = dependencies
@@ -218,6 +219,8 @@ class _ToolNode:
         records: list[ToolCallRecord] = list(state.tool_calls)
         scratchpad: dict[str, typing.Any] = dict(state.scratchpad)
         documents: list[dict[str, typing.Any]] = list(state.documents)
+        
+        tool_calls_metric = get_metric("tool_calls_total")
 
         for call in calls:
             name = call.get("name")
@@ -237,8 +240,9 @@ class _ToolNode:
             record = _invoke_tool(registry, name, arguments, call_id, state)
             records.append(record)
             scratchpad[call_id] = record.result
-            if TOOL_CALLS_TOTAL:
-                TOOL_CALLS_TOTAL.labels(tool=name, status=record.status).inc()
+            
+            if tool_calls_metric:
+                tool_calls_metric.labels(tool=name, status=record.status).inc()
 
             if record.status == "error":
                 state.trail.record_now(
@@ -286,7 +290,7 @@ class _ToolNode:
 
 
 class _FinalizeNode:
-    """Produce the final answer and persist a completion event."""
+    """生成最终回答并持久化完成事件。"""
 
     def __init__(self, dependencies: AgentDependencies) -> None:
         self._dependencies = dependencies
@@ -302,7 +306,7 @@ class _FinalizeNode:
                 iteration=state.iterations,
                 node="finalize",
                 status="warning",
-                message="No final answer produced; emitting safe fallback.",
+                message="未产生最终回答，已安全拒答。",
             )
 
         if not citations and state.documents:
@@ -336,75 +340,49 @@ def _invoke_with_fallback(
     state: AgentState,
     agent_settings: AgentSettings,
 ) -> tuple[ChatResponse, bool]:
-    """Invoke the executor and record every model attempt."""
+    """调用执行器并记录每一次模型尝试的审计轨迹。"""
+    result = executor.invoke(request)
 
-    last_error: BaseException | None = None
-    for attempt_index, model in enumerate(executor._chain):  # noqa: SLF001 - controlled iteration for observability
-        started = time.perf_counter()
-        try:
-            bound = model.bind_tools(registry.list_tools())
-            response = bound.invoke(request)
-            latency = time.perf_counter() - started
-            state.trail.record_now(
-                event_type=AgentEventType.MODEL_CALL,
-                iteration=state.iterations + 1,
-                node="reason",
-                model=(getattr(model, "_settings", None) and model._settings.model_name) or model.name,
-                provider=model.name,
-                status="ok",
-                latency_seconds=latency,
-            )
-            used_fallback = attempt_index > 0
-            if used_fallback:
-                state.trail.record_now(
-                    event_type=AgentEventType.MODEL_FALLBACK,
-                    iteration=state.iterations + 1,
-                    node="reason",
-                    provider=model.name,
-                    status="ok",
-                    data={"attempt": attempt_index + 1},
-                )
-            return response, used_fallback
-        except Exception as exc:
-            last_error = exc
-            classified = _classify(exc)
-            state.trail.record_now(
-                event_type=AgentEventType.MODEL_CALL,
-                iteration=state.iterations + 1,
-                node="reason",
-                provider=model.name,
-                status="error",
-                message=str(exc),
-                retryable=classified.retryable,
-            )
-            if not classified.retryable:
-                break
-
-    raise AgentExecutionError(
-        "All configured models failed during agent reasoning.",
-        details={
-            "attempts": [attempt.model_dump() for attempt in _attempts_from_executor(executor)],
-            "last_error": str(last_error),
-        },
-    )
-
-
-def _attempts_from_executor(executor: FallbackExecutor):
-    """Derive a public representation of the executor's priority chain."""
-
-    from src.model.fallback import FallbackAttempt
-
-    attempts: list[FallbackAttempt] = []
-    for _index, model in enumerate(executor._chain):  # noqa: SLF001 - inspection only
-        attempts.append(
-            FallbackAttempt(
-                provider=model.name,
-                model_name=(getattr(model, "_settings", None) and model._settings.model_name) or model.name,
-                status="configured",
-                response=None,
-            )
+    for attempt in result.attempts:
+        state.trail.record_now(
+            event_type=AgentEventType.MODEL_CALL,
+            iteration=state.iterations + 1,
+            node="reason",
+            model=attempt.model_name,
+            provider=attempt.provider,
+            status="ok" if attempt.status == "success" else "error",
+            latency_seconds=attempt.elapsed_seconds,
+            message=attempt.error_message if attempt.status != "success" else None,
         )
-    return attempts
+        
+        if attempt.status == "success" and attempt.provider != executor.providers[0]:
+            state.trail.record_now(
+                event_type=AgentEventType.MODEL_FALLBACK,
+                iteration=state.iterations + 1,
+                node="reason",
+                provider=attempt.provider,
+                status="ok",
+                data={"attempt": len(result.attempts)},
+            )
+
+    if not result.succeeded or not result.response:
+        raise AgentExecutionError(
+            "智能体推理阶段所有配置的模型均调用失败。",
+            details={
+                "attempts": [
+                    {
+                        "provider": a.provider,
+                        "model_name": a.model_name,
+                        "error": a.error_message,
+                    }
+                    for a in result.attempts
+                ],
+                "last_error": result.final_error,
+            },
+        )
+
+    used_fallback = len(result.attempts) > 1
+    return result.response, used_fallback
 
 
 def _invoke_tool(
@@ -421,15 +399,14 @@ def _invoke_tool(
     except ValidationError:
         raise
     except Exception as exc:
-        logger.warning("tool_failed", extra={"tool": name, "call_id": call_id, "error": str(exc)})
+        logger.warning("tool_failed | tool=%s | call_id=%s | error=%s", name, call_id, str(exc))
         return ToolCallRecord(tool=name, arguments=arguments, status="error", error=str(exc))
 
 
 def _capture_retrieval_documents(
     result: typing.Any, existing: list[dict[str, typing.Any]], trail: AgentAuditTrail
 ) -> list[dict[str, typing.Any]]:
-    """Convert a retrieval result into auditable document summaries."""
-
+    """将检索结果转换为可审计的文档摘要。"""
     documents = list(existing)
     if isinstance(result, RetrievedContext):
         context = result
@@ -476,7 +453,7 @@ def _summarize_result(result: typing.Any) -> str:
     if isinstance(result, str):
         return result[:500]
     if isinstance(result, (list, dict)):
-        rendered = __import__("json").dumps(result, ensure_ascii=False)
+        rendered = json.dumps(result, ensure_ascii=False)
         return rendered[:500]
     return str(result)[:500]
 
@@ -485,7 +462,7 @@ def _serialize_tool_result(result: typing.Any) -> str:
     if isinstance(result, str):
         return result
     try:
-        return __import__("json").dumps(result, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
     except TypeError:
         return str(result)
 
@@ -514,23 +491,8 @@ def _build_reasoning_messages(state: AgentState) -> list[dict[str, typing.Any]]:
     return messages
 
 
-def _agent_answer_request(state: AgentState) -> AnswerRequest:
-    return AnswerRequest(
-        question=state.question,
-        tenant_id=state.tenant_id,
-        owner_id=state.owner_id,
-        allowed_sources=state.allowed_sources,
-    )
-
-
-def _classify(exc: BaseException):
-    from src.model.errors import classify_model_error
-
-    return classify_model_error(exc, provider=getattr(exc, "provider", None))
-
-
 class AgentRunner:
-    """Runnable facade around the compiled LangGraph agent."""
+    """围绕编译后 LangGraph 智能体的可运行门面。"""
 
     def __init__(self, graph: typing.Any, dependencies: AgentDependencies) -> None:
         self._graph = graph
@@ -548,7 +510,7 @@ class AgentRunner:
             },
         )
         started = time.perf_counter()
-        final_state = self._run_to_completion(state)
+        final_state = self._run_to_completion(state.model_dump())
         state.trail.complete()
         return _build_agent_response(request, final_state, time.perf_counter() - started)
 
@@ -564,7 +526,7 @@ class AgentRunner:
             },
         )
         started = time.perf_counter()
-        final_state = await self._graph.ainvoke(state)
+        final_state = await self._graph.ainvoke(state.model_dump())
         state.trail.complete()
         return _build_agent_response(request, final_state, time.perf_counter() - started)
 
@@ -572,7 +534,7 @@ class AgentRunner:
         state = self._build_state(request)
         state.trail.record_now(event_type=AgentEventType.STARTED, node="agent")
         try:
-            for event in self._graph.stream(state):
+            for event in self._graph.stream(state.model_dump()):
                 yield _normalize_event(request.request_id, event)
         except ValidationError:
             raise
@@ -593,9 +555,9 @@ class AgentRunner:
             state.trail.complete()
             yield {"request_id": request.request_id, "event": "completed"}
 
-    def _run_to_completion(self, state: AgentState) -> typing.Any:
+    def _run_to_completion(self, state_dict: dict[str, typing.Any]) -> typing.Any:
         try:
-            return self._graph.invoke(state)
+            return self._graph.invoke(state_dict)
         except AgentExecutionError:
             raise
         except ValidationError:
@@ -604,13 +566,17 @@ class AgentRunner:
             raise
         except Exception as exc:
             raise AgentExecutionError(
-                f"Agent execution failed unexpectedly: {exc}",
-                details={"request_id": state.request_id},
+                f"智能体执行过程中发生意外失败: {exc}",
+                details={"request_id": state_dict.get("request_id")},
             ) from exc
 
     def _build_state(self, request: AgentRequest) -> AgentState:
         trail = AgentAuditTrail(request_id=request.request_id)
-        LoggingAgentEventListener(logger, only_types=None).on_event
+        
+        listener = LoggingAgentEventListener(logger, only_types=None)
+        if hasattr(trail, "add_listener"):
+            trail.add_listener(listener)
+
         return AgentState(
             request_id=request.request_id,
             question=request.question,
@@ -623,27 +589,17 @@ class AgentRunner:
         )
 
 
-class _ToolContext:
-    """Read-only context passed to tool implementations."""
+class _ToolContext(ToolContext):
+    """传递给工具实现的只读上下文，持有完整的 AgentState。"""
 
     def __init__(self, *, state: AgentState) -> None:
+        super().__init__(
+            tenant_id=state.tenant_id,
+            owner_id=state.owner_id,
+            allowed_sources=list(state.allowed_sources),
+            request_id=state.request_id,
+        )
         self.state = state
-
-    @property
-    def tenant_id(self) -> str:
-        return self.state.tenant_id
-
-    @property
-    def owner_id(self) -> str | None:
-        return self.state.owner_id
-
-    @property
-    def allowed_sources(self) -> list[str]:
-        return list(self.state.allowed_sources)
-
-    @property
-    def request_id(self) -> str:
-        return self.state.request_id
 
 
 def _history_messages(request: AgentRequest) -> list[dict[str, typing.Any]]:
@@ -705,8 +661,7 @@ def create_agent_runner(
     agent_settings: AgentSettings,
     guardrails_settings: GuardrailsSettings,
 ) -> AgentRunner:
-    """Create a fully wired agent runner."""
-
+    """创建完全装配好的智能体运行器。"""
     dependencies = AgentDependencies(
         executor=executor,
         rag_service=rag_service,
