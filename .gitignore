@@ -97,3 +97,5 @@ id_ed25519*
 *.orig
 *.rej
 *.tmp
+src/abandon/
+
