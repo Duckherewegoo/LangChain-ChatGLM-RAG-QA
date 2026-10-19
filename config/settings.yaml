@@ -1,62 +1,84 @@
-# Production-oriented settings. Secrets should still be supplied through environment
-# variables or a secrets manager; values here only document expected keys.
+# ============================================================
+# enterprise-rag-chatglm 配置文件
+# 优先级：代码默认值 < 本文件 < 环境变量 < 显式 overrides
+# 密钥（api_key）不建议写在这里，请通过 .env 或环境变量注入
+# ============================================================
 
+# ── 应用与 HTTP 服务 ──
 app:
-  name: enterprise-rag-chatglm
-  env: development
-  host: 0.0.0.0
-  port: 8000
+  name: enterprise-rag-chatglm       # 应用名称，用于日志与健康检查
+  env: development                    # development | staging | production
+  host: 0.0.0.0                       # 监听地址，生产建议 127.0.0.1 + 反向代理
+  port: 8000                          # 监听端口
 
+# ── 模型配置 ──
 model:
   chat:
-    provider: zhipu
-    model_name: glm-5.2
+    provider: zhipu                   # zhipu | deepseek | qwen | openai
+    model_name: glm-5.2               # 请核对智谱官方模型名，常见为 glm-4-plus
     temperature: 0.2
     max_tokens: 2048
     timeout_seconds: 45
     max_retries: 2
     base_url: https://open.bigmodel.cn/api/paas/v4/
-  embedding:
-    model_name: BAAI/bge-small-zh-v1.5
-    device: cpu
-    batch_size: 32
+    # api_key 请通过 MODEL_CHAT_API_KEY 环境变量注入，不要写在这里
 
+  embedding:
+    provider: local                   # local（本地 sentence-transformers）
+    model_name: BAAI/bge-small-zh-v1.5
+    device: cpu                       # cpu | cuda | mps
+    batch_size: 32
+    normalize: true                   # 向量 L2 归一化，用于余弦相似度
+
+# ── 文档摄入 ──
 ingest:
   supported_extensions:
     - .txt
     - .md
     - .pdf
     - .docx
-  chunk_size: 600
-  chunk_overlap: 100
-  min_characters: 50
+  chunk_size: 600                     # 单个文本块最大字符数
+  chunk_overlap: 100                  # 相邻块的字符重叠，用于防止上下文割裂
+  min_characters: 50                  # 小于此长度的段落直接丢弃
+  batch_size: 32                      # 批量向量化的批大小
 
+# ── 检索与重排 ──
 retrieval:
+  top_k: 8                            # 最终返回给 LLM 的证据条数
+  fetch_multiplier: 3                 # 召回时的放大倍数，top_k * multiplier 为向量召回上限
+  per_query_top_k: 20                 # 多查询改写时每条查询各自召回的条数
   vector_store:
-    type: chromadb
-    collection: enterprise_knowledge
+    type: chromadb                    # chromadb | faiss（目前仅 chromadb 实现）
+    collection: enterprise_knowledge  # 集合名，实际会拼接模型指纹后缀
     persist_directory: ./data/index
-  top_k: 8
-  fetch_multiplier: 3
   rerank:
     enabled: true
     model_name: BAAI/bge-reranker-v2-m3
     top_k: 4
-    min_score: 0.05
+    min_score: 0.05                   # 重排分数低于此阈值的候选会被丢弃
 
+# ── Agent 与护栏 ──
 agent:
-  max_iterations: 6
-  max_tool_calls: 8
+  max_iterations: 6                   # reason->tool 最大循环轮次
+  max_tool_calls: 8                   # 单次请求内工具调用总数上限
   allowed_tools:
     - retrieve_knowledge
     - list_sources
     - summarize_citations
+  review:
+    enabled: true                     # 是否启用发布前审核
+    use_llm: false                    # 是否使用 LLM 语义审核（false 时仅规则审核）
+    max_retries: 1                    # 审核不通过时重新推理的次数
+    max_evidence_chars: 6000          # 喂给审核器的证据最大字符数
 
 security:
-  max_question_length: 2000
-  max_history_messages: 12
-  prompt_injection_action: reject
+  max_question_length: 2000           # 用户问题最大字符数
+  max_answer_length: 8000             # 答案输出最大字符数
+  max_history_messages: 12            # 传入 LLM 的历史消息条数上限
+  prompt_injection_action: reject     # reject | log | sanitize
 
+# ── 可观测性 ──
 observability:
   tracing_enabled: false
   metrics_enabled: true
+  log_level: INFO                     # DEBUG | INFO | WARNING | ERROR

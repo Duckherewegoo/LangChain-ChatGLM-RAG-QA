@@ -1,34 +1,61 @@
 [project]
 name = "enterprise-rag-chatglm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Configurable enterprise retrieval-augmented generation assistant with LangChain, LangGraph, and a pluggable ChatGLM model adapter."
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
-license = { text = "MIT" }
-dependencies = [
-  "langchain>=1.0,<2.0",
-  "langchain-core>=1.0,<2.0",
-  "langgraph>=1.0,<2.0",
-  "langchain-openai>=1.0,<2.0",
-  "langchain-text-splitters>=1.0,<2.0",
-  "langchain-community>=0.3,<1.0",
-  "chromadb>=1.0,<2.0",
-  "sentence-transformers>=3.0,<5.0",
-  "fastapi>=0.115,<1.0",
-  "uvicorn[standard]>=0.30,<1.0",
-  "pydantic>=2.7,<3.0",
-  "pydantic-settings>=2.4,<3.0",
-  "structlog>=24.1,<26.0",
-  "prometheus-client>=0.20,<1.0",
+license = { text = "GPL-3.0-or-later" }
+authors = [
+    { name = "DakeGinger", email = "dakeginger@qq.com" }
 ]
+dependencies = [
+    # ── 核心框架与模型层 ──
+    "langchain>=0.3,<2.0",
+    "langchain-core>=0.3,<2.0",
+    "langchain-openai>=0.2,<2.0",
+    "langchain-text-splitters>=0.3,<2.0",
+    "langchain-community>=0.3,<1.0",
+    "langgraph>=0.2,<2.0",
+    "openai>=1.0,<2.0",
+    "httpx>=0.27,<1.0",
+
+    # ── Web 服务 ──
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "python-multipart>=0.0.9,<1.0",
+
+    # ── 数据校验与配置 ──
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.4,<3.0",
+    "pyyaml>=6.0,<7.0",
+
+    # ── 向量检索与重排 ──
+    "chromadb>=0.5,<2.0",
+    "sentence-transformers>=3.0,<5.0",
+    "pypdf>=4.0,<6.0",
+    "python-docx>=1.1,<2.0",
+
+    # ── 可观测性 ──
+    "loguru>=0.7,<1.0",
+    "prometheus-client>=0.20,<1.0",
+]
+
+[project.optional-dependencies]
+# 如果使用 MCP 工具源，需要安装此依赖
+mcp = [
+    "mcp>=1.0,<2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Duckherewegoo/enterprise-rag-chatglm"
+Repository = "https://github.com/Duckherewegoo/enterprise-rag-chatglm.git"
 
 [dependency-groups]
 dev = [
-  "pytest>=8.0,<10.0",
-  "pytest-asyncio>=0.24,<2.0",
-  "ruff>=0.6,<2.0",
-  "mypy>=1.10,<2.0",
-  "httpx>=0.27,<1.0",
+    "pytest>=8.0,<10.0",
+    "pytest-asyncio>=0.24,<2.0",
+    "ruff>=0.6,<2.0",
+    "mypy>=1.10,<2.0",
 ]
 
 [build-system]
@@ -38,49 +65,48 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
 
+# ==========================================
+# 工具链配置
+# ==========================================
+
 [tool.ruff]
 line-length = 130
 target-version = "py310"
-extend-exclude = ["data", "build", "dist"]
+extend-exclude = ["data", "build", "dist", "tests"]
 
 [tool.ruff.lint]
 select = [
-  "E", "W", "F", "I", "B", "UP", "C4", "SIM", "PL", "RUF",
-  "N", "RET", "SLF", "PIE", "PT", "TCH",
+    "E", "W", "F", "I", "B", "UP", "C4", "SIM", "PL", "RUF",
+    "N", "RET", "SLF", "PIE", "PT", "TCH",
 ]
 ignore = [
-  "PLR0913",
-  "PLR0912",
-  "PLR0904",
-  "PLR0911",
-  "PLR0915",
-  "PLR2004",
-  "PLR0917",
-  "RUF001",
-  "RUF002",
-  "RUF003",
-  "RUF100",
-  "RUF022",
-  "PLW0603",
-  "PLW2901",
-  "N801",
-  "N802",
-  "N814",
-  "N818",
-  "B018",
-  "B027",
-  "SLF001",
-  "TC001",
-  "TC004",
-  "PLC0415",
-  "C4",
-  "SIM",
-  "UP",
-  "RET",
-  "PIE",
-  "PT",
-  "TCH",
+    "PLR0913", # 函数参数太多（Factory / 适配器模式常见）
+    "PLR0912", # 分支太多（模型路由 / 融合策略逻辑）
+    "PLR0904", # 类的公开方法太多（Service 门面）
+    "PLR0911", # return 语句太多（解析器 / 策略分发）
+    "PLR0915", # 语句太多（复杂解析逻辑）
+    "PLR2004", # 魔法数字比较（如 status_code == 200）
+    "RUF001",  # 全角标点（中文注释）
+    "RUF002",  # 全角标点（docstring）
+    "RUF003",  # 全角标点（注释）
+    "RUF100",  # 未使用的 noqa
+    "RUF022",  # __all__ 排序（手动分组更易读）
+    "PLW0603", # global 语句（容器单例管理）
+    "PLW2901", # 循环内变量覆盖
+    "N801",    # 类名不规范（如 _OpenAICompatibleChatModel）
+    "N802",    # 函数名不规范（如 __enter__）
+    "N814",    # 导入别名太长（如 import xxx as yyy）
+    "N818",    # 异常类名以 Error 结尾（如 RerankerUnavailable）
+    "B018",    # 无意义的表达式（如占位符 ...）
+    "B027",    # 空的非抽象方法
+    "SLF001",  # 访问私有成员（测试或内部组装时需要）
+    "TC001",   # typing-only import（某些类型需要在运行时实例化）
+    "TC004",   # typing-only import
+    "PLC0415", # import 不在顶层（为了解决循环导入）
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = ["S101", "PLR2004", "E501"] # 测试文件允许 assert、魔法数字、长行
 
 [tool.mypy]
 python_version = "3.10"
@@ -91,10 +117,11 @@ plugins = ["pydantic.mypy"]
 exclude = ["data/.*", "build/.*", "dist/.*"]
 
 [[tool.mypy.overrides]]
-module = ["chromadb.*", "sentence_transformers.*"]
+module = ["chromadb.*", "sentence_transformers.*", "mcp.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+pythonpath = ["."]

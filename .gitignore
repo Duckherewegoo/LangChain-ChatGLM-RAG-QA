@@ -1,28 +1,29 @@
-# Byte-compiled / optimized files
+# ── Python 字节码 ──────────────────────────────────────────
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 
-# Distribution / packaging
+# ── 分发 / 打包 ───────────────────────────────────────────
 .Python
 build/
 dist/
 *.egg-info/
 *.egg
 
-# Virtual environments
+# ── 虚拟环境 ──────────────────────────────────────────────
 .venv/
 venv/
 env/
 ENV/
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Testing / linting caches
+# ── 测试 /  lint / 覆盖率 ─────────────────────────────────
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -31,22 +32,68 @@ ENV/
 htmlcov/
 coverage.xml
 
-# OS
+# ── OS ────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Local data — 保留目录结构，忽略实际数据
-data/index/*
+# ── 数据与索引（保留目录结构，忽略内容）──────────────────
+# 模型权重与向量索引体积大，禁止提交；超 100MB 会被 GitHub 拒绝
+data/index/**
 !data/index/.gitkeep
-data/raw/*
+data/raw/**
 !data/raw/.gitkeep
 
-# Local secrets — 禁止提交 API Key 等敏感文件
-# 允许提交模板文件 .env.example
+!config/.env.example
+
+# 向量库落盘文件
+*.db
+*.sqlite3
+*.sqlite
+
+# 本地模型权重
+models/
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+*.pt
+*.pth
+
+# 嵌入与 HuggingFace 缓存
+.model_cache/
+.huggingface/
+.cache/
+
+# ── 日志与运行时 ──────────────────────────────────────────
+logs/
+*.log
+pids/
+*.pid
+run/
+
+# ── 密钥与敏感文件 ────────────────────────────────────────
+# 禁止提交 API Key、私钥、令牌
 .env
+.env/
 .env.local
 .env.*.local
 !.env.example
 config/.env
 config/.env.local
 config/.env.*.local
+config/*.local.yaml
+config/*.generated.*
+*.key
+*.pem
+*.crt
+id_rsa*
+id_ed25519*
+
+# ── Jupyter ───────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── 备份与临时 ────────────────────────────────────────────
+*.bak
+*.orig
+*.rej
+*.tmp
