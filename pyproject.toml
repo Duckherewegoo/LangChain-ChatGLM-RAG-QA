@@ -64,7 +64,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+sources = ["src"]
+packages = ["api", "rag", "model", "data_process", "settings", "main.py", "observability.py", "exceptions.py"]
 
 # ==========================================
 # 工具链配置
@@ -125,4 +126,4 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
-pythonpath = ["."]
+pythonpath = ["src"]

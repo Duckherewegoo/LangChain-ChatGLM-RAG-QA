@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import typing
 
-from src.exceptions import ModelConfigurationError
-from src.model.providers.openai_compatible import OpenAICompatibleChatModel
-from src.model.registry import register_provider
+from exceptions import ModelConfigurationError
+from model.providers.openai_compatible import OpenAICompatibleChatModel
+from model.registry import register_provider
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.settings import ModelChatSettings
+    from settings import ModelChatSettings
 
 _DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 _DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"

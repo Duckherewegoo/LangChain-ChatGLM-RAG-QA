@@ -4,7 +4,7 @@
 一个提供者只有在其对应的模块被导入后才会被注册，以此隔离可选 SDK 的依赖。
 """
 
-from src.model.providers import (  # noqa: F401 - 仅用于触发注册副作用
+from model.providers import (  # noqa: F401 - 仅用于触发注册副作用
     deepseek,
     doubao,
     openai_compatible,

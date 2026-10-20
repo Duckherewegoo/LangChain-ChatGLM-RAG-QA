@@ -2,8 +2,8 @@
 
 定义全局使用的 ChatModel 协议接口与标准化的请求、响应数据模型。
 
-业务层只能依赖本模块，具体的厂商实现位于 src.model.providers，
-通过 src.model.registry 注册。业务代码绝对不可直接引用具体厂商的 SDK。
+业务层只能依赖本模块，具体的厂商实现位于 model.providers，
+通过 model.registry 注册。业务代码绝对不可直接引用具体厂商的 SDK。
 """
 
 from __future__ import annotations

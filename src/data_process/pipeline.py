@@ -6,7 +6,7 @@ import logging
 import os
 import typing
 
-from src.exceptions import DocumentLoadError, IngestError
+from exceptions import DocumentLoadError, IngestError
 from .chunker import DocumentChunker, compute_document_id, normalize_whitespace
 from .loaders import DocumentLoader
 from .types import IngestStatistics

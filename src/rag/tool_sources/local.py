@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import typing
 
-from src.rag.tool_types import ToolContext, ToolHandler, ToolSpec
+from rag.tool_types import ToolContext, ToolHandler, ToolSpec
 
 from .base import ToolExecutionError, ToolSource
 

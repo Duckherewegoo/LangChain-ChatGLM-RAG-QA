@@ -15,22 +15,22 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-from src.exceptions import AgentExecutionError, RAGError, ValidationError
-from src.model import ChatRequest, FallbackExecutor
-from src.observability import get_logger, get_metric
-from src.rag.agent_events import (
+from exceptions import AgentExecutionError, RAGError, ValidationError
+from model import ChatRequest, FallbackExecutor
+from observability import get_logger, get_metric
+from rag.agent_events import (
     AgentAuditTrail,
     AgentEventType,
     LoggingAgentEventListener,
 )
-from src.rag.retrieval import RetrievedContext
-from src.rag.service import AnswerRequest, AnswerResult, RAGService
-from src.rag.tools import Guardrails, ToolCallRecord, ToolRegistry
-from src.rag.tool_types import ToolContext
+from rag.retrieval import RetrievedContext
+from rag.service import AnswerRequest, AnswerResult, RAGService
+from rag.tools import Guardrails, ToolCallRecord, ToolRegistry
+from rag.tool_types import ToolContext
 
 if typing.TYPE_CHECKING:
-    from src.model import ChatResponse
-    from src.settings import AgentSettings, GuardrailsSettings
+    from model import ChatResponse
+    from settings import AgentSettings, GuardrailsSettings
 
 logger = get_logger(__name__)
 

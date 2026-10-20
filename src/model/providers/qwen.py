@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import typing
 
-from src.model.errors import ModelConfigurationError
-from src.model.protocol import ChatModel, ChatRequest, ChatResponse
-from src.model.providers.openai_compatible import OpenAICompatibleChatModel
-from src.model.registry import register_provider
+from model.errors import ModelConfigurationError
+from model.protocol import ChatModel, ChatRequest, ChatResponse
+from model.providers.openai_compatible import OpenAICompatibleChatModel
+from model.registry import register_provider
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from collections.abc import Sequence
 
-    from src.settings import ModelChatSettings
+    from settings import ModelChatSettings
 
 _QWEN_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 _QWEN_DEFAULT_MODEL = "qwen-turbo"

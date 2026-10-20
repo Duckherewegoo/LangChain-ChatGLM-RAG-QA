@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from src.rag.types import RetrievedDocument
+from rag.types import RetrievedDocument
 
 
 @dataclasses.dataclass(frozen=True)

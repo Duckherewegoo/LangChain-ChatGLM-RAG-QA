@@ -6,8 +6,8 @@ import typing
 
 from pydantic import Field
 
-from src.observability import get_logger
-from src.rag.types import RetrievedContext
+from observability import get_logger
+from rag.types import RetrievedContext
 
 from .fusers import ResultFuser
 from .retrievers import RetrievalStrategy

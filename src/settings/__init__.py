@@ -3,7 +3,7 @@
 所有配置类与加载函数由 settings.py 定义，本包仅负责统一导出。
 """
 
-from src.settings.settings import (
+from settings.settings import (
     AgentSettings,
     ApiSettings,
     AppSettings,

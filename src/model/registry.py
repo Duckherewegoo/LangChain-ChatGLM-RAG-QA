@@ -10,11 +10,11 @@ from __future__ import annotations
 import threading
 import typing
 
-from src.exceptions import ConfigurationError
+from exceptions import ConfigurationError
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.model.protocol import ChatModel
-    from src.settings import ModelChatSettings
+    from model.protocol import ChatModel
+    from settings import ModelChatSettings
 
     ProviderFactory = typing.Callable[[ModelChatSettings], ChatModel]
 

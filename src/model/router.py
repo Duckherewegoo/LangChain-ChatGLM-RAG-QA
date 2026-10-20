@@ -4,8 +4,8 @@
 并决定模型是否可用于 Agent 的工具循环。
 它不负责执行请求，也不直接调用厂商 SDK。
 
-纯数据类型（如 ModelRoutingEntry、UseCaseBinding 等）位于 src.model.routing_types，
-以便 src.settings 可以在不引入整个模型层的情况下声明 model_router 字段。
+纯数据类型（如 ModelRoutingEntry、UseCaseBinding 等）位于 model.routing_types，
+以便 settings 可以在不引入整个模型层的情况下声明 model_router 字段。
 """
 
 from __future__ import annotations
@@ -14,8 +14,8 @@ import importlib
 import threading
 import typing
 
-from src.exceptions import ConfigurationError, ResourceNotFoundError
-from src.model.routing_types import (
+from exceptions import ConfigurationError, ResourceNotFoundError
+from model.routing_types import (
     ModelCapabilitySettings,
     ModelRouterSettings,
     ModelRoutingEntry,
@@ -23,8 +23,8 @@ from src.model.routing_types import (
 )
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.model.fallback import FallbackExecutor
-    from src.model.protocol import ChatModel
+    from model.fallback import FallbackExecutor
+    from model.protocol import ChatModel
 
 
 class ModelRoute:
@@ -48,7 +48,7 @@ class ModelRoute:
 
     def build_executor(self, *, max_attempts_per_provider: int = 1) -> "FallbackExecutor":
         """使用解析后的模型链创建 Fallback 执行器。"""
-        from src.model.fallback import FallbackExecutor
+        from model.fallback import FallbackExecutor
 
         return FallbackExecutor(
             self.primary,
@@ -91,7 +91,7 @@ class ModelRouter:
             _ensure_providers_registered()
 
             # 延迟导入工厂函数和协议，避免顶层循环依赖
-            from src.model.manager import create_chat_model
+            from model.manager import create_chat_model
 
             # 复用 routing_types 中的转换方法，避免重复实现
             model = create_chat_model(entry.to_provider_settings())
@@ -140,7 +140,7 @@ def _ensure_providers_registered() -> None:
     采用懒加载导入可以避免在进程启动时强行要求所有可选 SDK 必须存在。
     """
     try:
-        importlib.import_module("src.model.providers")
+        importlib.import_module("model.providers")
     except ImportError as exc:
         raise ConfigurationError(
             "无法加载模型提供者（Provider）包，请检查依赖是否已正确安装。",

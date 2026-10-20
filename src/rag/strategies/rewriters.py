@@ -6,8 +6,8 @@ import abc
 import json
 import typing
 
-from src.model.protocol import ChatModel, ChatRequest
-from src.observability import get_logger
+from model.protocol import ChatModel, ChatRequest
+from observability import get_logger
 
 from .types import QueryRewrite
 

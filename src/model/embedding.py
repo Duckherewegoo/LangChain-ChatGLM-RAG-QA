@@ -17,7 +17,7 @@ if typing.TYPE_CHECKING:  # 仅用于类型检查
 
     from sentence_transformers import SentenceTransformer
 
-    from src.model.routing_types import ModelEmbeddingSettings
+    from model.routing_types import ModelEmbeddingSettings
 
 _E5_QUERY_INSTRUCTION = "query: "
 

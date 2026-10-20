@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import typing
 
-from src.model.protocol import ChatModel
-from src.model.registry import resolve_factory
+from model.protocol import ChatModel
+from model.registry import resolve_factory
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.settings import ModelChatSettings
+    from settings import ModelChatSettings
 
 # 工厂函数的类型别名
 ProviderFactory = typing.Callable[["ModelChatSettings"], ChatModel]

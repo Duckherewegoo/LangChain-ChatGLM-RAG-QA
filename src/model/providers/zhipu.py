@@ -1,7 +1,7 @@
 """智谱 AI ChatGLM 厂商适配器。
 
 本模块默认注册一个指向智谱 AI OpenAI 兼容端点的提供者。
-它继承自 src.model.providers.openai_compatible 的通用协议处理逻辑，
+它继承自 model.providers.openai_compatible 的通用协议处理逻辑，
 仅覆盖用于区分 ChatGLM 的默认配置。
 """
 
@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import typing
 
-from src.model.errors import ModelConfigurationError
-from src.model.providers.openai_compatible import OpenAICompatibleChatModel
-from src.model.registry import register_provider
+from model.errors import ModelConfigurationError
+from model.providers.openai_compatible import OpenAICompatibleChatModel
+from model.registry import register_provider
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.settings import ModelChatSettings
+    from settings import ModelChatSettings
 
 # 注意：请核对智谱官方最新文档，确认该兼容模式端点是否准确
 _ZHIPU_DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/compatibles/v1"

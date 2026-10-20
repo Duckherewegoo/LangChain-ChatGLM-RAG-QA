@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from src.rag.agent_events import AgentAuditTrail, AgentEventType
-from src.rag.tool_sources import LocalToolSource
-from src.rag.tool_types import ToolContext
-from src.rag.tools import ToolRegistry
+from rag.agent_events import AgentAuditTrail, AgentEventType
+from rag.tool_sources import LocalToolSource
+from rag.tool_types import ToolContext
+from rag.tools import ToolRegistry
 
 
 class _StubModel:

@@ -16,20 +16,20 @@ import pytest
 # 保证项目根在 sys.path 上，避免 tests 被当作独立包之外的模块。
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.model.protocol import ChatModel, ChatRequest, ChatResponse  # noqa: E402
-from src.model.registry import clear_registry, register_provider  # noqa: E402
-from src.model.router import ModelRouter  # noqa: E402,F401  # 保留以兼容旧导入
-from src.model.routing_types import (  # noqa: E402
+from model.protocol import ChatModel, ChatRequest, ChatResponse  # noqa: E402
+from model.registry import clear_registry, register_provider  # noqa: E402
+from model.router import ModelRouter  # noqa: E402,F401  # 保留以兼容旧导入
+from model.routing_types import (  # noqa: E402
     ModelRouterSettings,
     ModelRoutingEntry,
     UseCaseBinding,
 )
-from src.rag.agent import AgentRequest  # noqa: E402,F401
-from src.rag.retrieval import RetrievalPipeline  # noqa: E402
-from src.rag.service import AnswerRequest, RAGService  # noqa: E402,F401
-from src.rag.tools import Guardrails, ToolRegistry, create_rag_tool_registry  # noqa: E402
-from src.rag.vector_store import SearchResult, VectorRecord  # noqa: E402
-from src.settings import (  # noqa: E402
+from rag.agent import AgentRequest  # noqa: E402,F401
+from rag.retrieval import RetrievalPipeline  # noqa: E402
+from rag.service import AnswerRequest, RAGService  # noqa: E402,F401
+from rag.tools import Guardrails, ToolRegistry, create_rag_tool_registry  # noqa: E402
+from rag.vector_store import SearchResult, VectorRecord  # noqa: E402
+from settings import (  # noqa: E402
     AgentSettings,
     AppSettings,
     GuardrailsSettings,
@@ -300,6 +300,6 @@ def guardrails(app_settings: AppSettings) -> Guardrails:
 
 def _single_executor(model: ChatModel):
     """构造只包含一个模型、不重试的 FallbackExecutor。"""
-    from src.model.fallback import FallbackExecutor
+    from model.fallback import FallbackExecutor
 
     return FallbackExecutor(primary=model, secondaries=[], max_attempts_per_provider=1)

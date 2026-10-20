@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import typing
 
-from src.model.protocol import ChatRequest, ChatResponse
-from src.rag.types import RetrievedContext, RetrievedDocument
+from model.protocol import ChatRequest, ChatResponse
+from rag.types import RetrievedContext, RetrievedDocument
 
 
 class FakeChatModel:

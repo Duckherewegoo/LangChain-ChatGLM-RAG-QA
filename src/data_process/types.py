@@ -5,7 +5,7 @@ from __future__ import annotations
 import typing
 from pydantic import BaseModel, Field
 
-from src.rag.vector_store import VectorRecord
+from rag.vector_store import VectorRecord
 
 
 class Chunk(BaseModel):

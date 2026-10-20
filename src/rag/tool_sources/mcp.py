@@ -11,7 +11,7 @@ import os
 import threading
 import typing
 
-from src.rag.tool_types import ToolContext, ToolSpec
+from rag.tool_types import ToolContext, ToolSpec
 
 from .base import ToolExecutionError, ToolSource
 

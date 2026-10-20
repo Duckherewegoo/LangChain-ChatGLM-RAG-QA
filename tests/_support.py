@@ -11,7 +11,7 @@ from __future__ import annotations
 import typing
 from collections.abc import Sequence
 
-from src.model.protocol import ChatModel, ChatRequest, ChatResponse
+from model.protocol import ChatModel, ChatRequest, ChatResponse
 
 
 class FakeChatModel:

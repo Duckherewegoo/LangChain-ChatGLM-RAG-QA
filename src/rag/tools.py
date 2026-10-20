@@ -19,17 +19,17 @@ import typing
 
 from pydantic import BaseModel, Field
 
-from src.exceptions import AgentExecutionError, PermissionDeniedError, ValidationError
-from src.rag.tool_sources import (
+from exceptions import AgentExecutionError, PermissionDeniedError, ValidationError
+from rag.tool_sources import (
     LocalToolSource,
     ToolSource,
     create_tool_source,
 )
-from src.rag.tool_types import ToolContext, ToolHandler, ToolSpec
+from rag.tool_types import ToolContext, ToolHandler, ToolSpec
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.rag.service import RAGService
-    from src.settings import GuardrailsSettings
+    from rag.service import RAGService
+    from settings import GuardrailsSettings
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +201,7 @@ def create_rag_tool_registry(service: "RAGService") -> ToolRegistry:
     def retrieve_knowledge(
         arguments: dict[str, typing.Any], context: ToolContext
     ) -> dict[str, typing.Any]:
-        from src.rag.service import AnswerRequest
+        from rag.service import AnswerRequest
 
         safe_arguments = dict(arguments or {})
         safe_arguments.setdefault("tenant_id", context.tenant_id)
@@ -222,7 +222,7 @@ def create_rag_tool_registry(service: "RAGService") -> ToolRegistry:
     def list_sources(
         arguments: dict[str, typing.Any], context: ToolContext
     ) -> dict[str, typing.Any]:
-        from src.rag.service import AnswerRequest
+        from rag.service import AnswerRequest
 
         query = str(arguments.get("query", "")).strip()
         if not query:

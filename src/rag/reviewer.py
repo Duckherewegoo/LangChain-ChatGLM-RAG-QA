@@ -28,9 +28,9 @@ import typing
 
 from pydantic import BaseModel, Field
 
-from src.model.protocol import ChatModel, ChatRequest, ChatResponse
-from src.observability import get_logger
-from src.rag.roles import Blackboard, ReviewerRole
+from model.protocol import ChatModel, ChatRequest, ChatResponse
+from observability import get_logger
+from rag.roles import Blackboard, ReviewerRole
 
 logger = get_logger(__name__)
 

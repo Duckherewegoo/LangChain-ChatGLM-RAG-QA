@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from src.data_process.pipeline import DocumentChunker, DocumentLoader, IngestPipeline
-from src.exceptions import DocumentLoadError, PermissionDeniedError, ValidationError
-from src.model.fallback import FallbackExecutor
-from src.model.protocol import ChatResponse
-from src.rag.agent import AgentDependencies, AgentRequest, AgentRunner, build_agent
-from src.rag.service import AnswerRequest
-from src.rag.tools import Guardrails, ToolRegistry
-from src.settings import AgentSettings, GuardrailsSettings
+from data_process.pipeline import DocumentChunker, DocumentLoader, IngestPipeline
+from exceptions import DocumentLoadError, PermissionDeniedError, ValidationError
+from model.fallback import FallbackExecutor
+from model.protocol import ChatResponse
+from rag.agent import AgentDependencies, AgentRequest, AgentRunner, build_agent
+from rag.service import AnswerRequest
+from rag.tools import Guardrails, ToolRegistry
+from settings import AgentSettings, GuardrailsSettings
 from tests._support import AuditableModel, ToolFirstModel
 
 

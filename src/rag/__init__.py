@@ -5,11 +5,11 @@
 以避免循环依赖和启动时的过度加载。
 """
 
-from src.rag.tool_types import ToolContext, ToolSpec
-from src.rag.types import RetrievedContext, RetrievedDocument
+from rag.tool_types import ToolContext, ToolSpec
+from rag.types import RetrievedContext, RetrievedDocument
 
 # 如果确实有一些经常被外部使用、且没有循环依赖和重型副作用的类，可以在这里暴露：
-# from src.rag.collection_policy import EmbeddingFingerprint, CollectionPolicy
+# from rag.collection_policy import EmbeddingFingerprint, CollectionPolicy
 
 __all__ = [
     "RetrievedContext",

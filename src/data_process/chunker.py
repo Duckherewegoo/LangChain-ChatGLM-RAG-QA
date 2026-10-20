@@ -7,7 +7,7 @@ import os
 import re
 import typing
 
-from src.rag.vector_store import VectorRecord
+from rag.vector_store import VectorRecord
 from .types import Chunk
 
 

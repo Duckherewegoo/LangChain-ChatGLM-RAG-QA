@@ -6,12 +6,12 @@ import abc
 import math
 import typing
 
-from src.rag.types import RetrievedDocument
+from rag.types import RetrievedDocument
 
 from .types import Candidate
 
 if typing.TYPE_CHECKING:
-    from src.rag.retrieval import RetrievalPipeline
+    from rag.retrieval import RetrievalPipeline
 
 
 class RetrievalStrategy(abc.ABC):

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from src.exceptions import ModelInvocationError, ModelNotConfiguredError
+from exceptions import ModelInvocationError, ModelNotConfiguredError
 
 # ==================== 细粒度异常定义 ====================
 

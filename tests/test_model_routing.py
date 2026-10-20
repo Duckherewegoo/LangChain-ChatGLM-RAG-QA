@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.model import (
+from model import (
     ChatRequest,
     ChatResponse,
     FallbackExecutor,
@@ -13,7 +13,7 @@ from src.model import (
     UseCaseBinding,
     classify_model_error,
 )
-from src.model.errors import (
+from model.errors import (
     ModelAuthenticationError,
     ModelTimeoutError,
 )

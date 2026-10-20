@@ -12,8 +12,8 @@ import typing
 
 from pydantic import BaseModel, Field
 
-from src.model.protocol import ChatModel, ChatRequest, ChatResponse
-from src.observability import get_logger
+from model.protocol import ChatModel, ChatRequest, ChatResponse
+from observability import get_logger
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from collections.abc import Iterable
@@ -147,7 +147,7 @@ class FallbackExecutor:
         model: ChatModel, exc: BaseException, started: float, attempt_index: int
     ) -> FallbackAttempt:
         # 局部导入防止顶层的循环依赖
-        from src.model.errors import classify_model_error
+        from model.errors import classify_model_error
 
         classified = classify_model_error(exc, provider=model.name)
         model_name = getattr(model, "model_name", model.name)

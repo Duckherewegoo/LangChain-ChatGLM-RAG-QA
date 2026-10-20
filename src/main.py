@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import sys
 
-from src.observability import (
+from observability import (
     configure_observability,
     get_logger,
     shutdown_observability,
 )
-from src.settings import load_settings
+from settings import load_settings
 
 from dotenv import load_dotenv
 load_dotenv()  # 读取 .env
@@ -36,8 +36,8 @@ def main() -> int:
     )
 
     try:
-        from src.api.server import create_app
-        from src.rag.container import initialize_container
+        from api.server import create_app
+        from rag.container import initialize_container
     except Exception as exc:
         logger.exception(f"应用初始化失败 | error={exc}")
         return 3

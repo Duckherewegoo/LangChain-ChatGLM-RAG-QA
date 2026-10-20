@@ -7,15 +7,15 @@ from contextlib import nullcontext
 
 from pydantic import BaseModel
 
-from src.exceptions import RetrievalError
-from src.model.embedding import EmbeddingModel
-from src.observability import get_logger, get_metric
-from src.rag.reranker import Reranker, create_reranker
-from src.rag.types import RetrievedContext, RetrievedDocument
+from exceptions import RetrievalError
+from model.embedding import EmbeddingModel
+from observability import get_logger, get_metric
+from rag.reranker import Reranker, create_reranker
+from rag.types import RetrievedContext, RetrievedDocument
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.rag.vector_store import VectorStore
-    from src.settings import RetrievalSettings
+    from rag.vector_store import VectorStore
+    from settings import RetrievalSettings
 
 logger = get_logger(__name__)
 

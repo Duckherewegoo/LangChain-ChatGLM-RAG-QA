@@ -6,7 +6,7 @@ import dataclasses
 
 from pydantic import BaseModel, Field
 
-from src.rag.types import RetrievedDocument
+from rag.types import RetrievedDocument
 
 
 @dataclasses.dataclass(frozen=True)

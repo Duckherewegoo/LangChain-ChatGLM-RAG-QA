@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 
 from pydantic import BaseModel
 
-from src.rag.types import RetrievedDocument
+from rag.types import RetrievedDocument
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from sentence_transformers import CrossEncoder

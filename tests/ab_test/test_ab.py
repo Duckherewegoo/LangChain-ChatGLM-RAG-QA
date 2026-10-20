@@ -13,8 +13,8 @@ import time
 
 import pytest
 
-from src.exceptions import ValidationError
-from src.rag.orchestrator import OrchestratorRequest
+from exceptions import ValidationError
+from rag.orchestrator import OrchestratorRequest
 
 from .cases import ABCase, CASES
 from .fakes import FakeChatModel, FakeRetrieval

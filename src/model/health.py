@@ -12,9 +12,9 @@ import typing
 
 from pydantic import BaseModel, Field
 
-from src.model.errors import classify_model_error
-from src.model.protocol import ChatModel, ChatRequest, ChatResponse
-from src.observability import get_logger
+from model.errors import classify_model_error
+from model.protocol import ChatModel, ChatRequest, ChatResponse
+from observability import get_logger
 
 if typing.TYPE_CHECKING:
     from collections.abc import Iterable

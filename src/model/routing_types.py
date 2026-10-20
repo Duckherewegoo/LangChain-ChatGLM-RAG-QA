@@ -1,6 +1,6 @@
 """多模型路由的纯数据类型定义。
 
-本模块刻意不依赖 src.settings 或 src.model.manager。
+本模块刻意不依赖 settings 或 model.manager。
 其存在的目的是为了打破 settings -> router -> manager -> settings 的循环导入链。
 
 由于 Pydantic v2 的 BaseSettings 在解析前向引用失败时会拒绝实例化，
@@ -14,7 +14,7 @@ import typing
 from pydantic import BaseModel, Field, model_validator
 
 if typing.TYPE_CHECKING:
-    from src.settings import ModelChatSettings
+    from settings import ModelChatSettings
 
 
 class ModelCapabilitySettings(BaseModel):
@@ -50,7 +50,7 @@ class ModelRoutingEntry(BaseModel):
 
         采用局部导入以避免 routing_types -> settings -> routing_types 的循环导入。
         """
-        from src.settings import ModelChatSettings
+        from settings import ModelChatSettings
 
         return ModelChatSettings(
             provider=self.provider,

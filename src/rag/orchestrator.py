@@ -15,26 +15,26 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-from src.exceptions import AgentExecutionError, PermissionDeniedError, ValidationError
-from src.model.protocol import ChatRequest, ChatResponse
-from src.observability import get_logger
-from src.rag.agent_events import AgentAuditTrail, AgentEventType
-from src.rag.reviewer import AnswerReviewer, ReviewReport
-from src.rag.roles import (
+from exceptions import AgentExecutionError, PermissionDeniedError, ValidationError
+from model.protocol import ChatRequest, ChatResponse
+from observability import get_logger
+from rag.agent_events import AgentAuditTrail, AgentEventType
+from rag.reviewer import AnswerReviewer, ReviewReport
+from rag.roles import (
     AgentDefinition,
     Blackboard,
     Role,
     enterprise_qa_definition,
 )
-from src.rag.tool_sources import LocalToolSource
-from src.rag.tool_types import ToolContext
-from src.rag.tools import Guardrails, ToolCallRecord, ToolRegistry
-from src.settings import AgentSettings, GuardrailsSettings
+from rag.tool_sources import LocalToolSource
+from rag.tool_types import ToolContext
+from rag.tools import Guardrails, ToolCallRecord, ToolRegistry
+from settings import AgentSettings, GuardrailsSettings
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.model.fallback import FallbackExecutor
-    from src.rag.retrieval import RetrievalPipeline
-    from src.rag.types import RetrievedDocument
+    from model.fallback import FallbackExecutor
+    from rag.retrieval import RetrievalPipeline
+    from rag.types import RetrievedDocument
 
 logger = get_logger(__name__)
 

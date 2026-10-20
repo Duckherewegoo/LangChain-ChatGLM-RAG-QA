@@ -11,16 +11,16 @@ import typing
 
 from pydantic import BaseModel, Field
 
-from src.exceptions import ModelInvocationError, RetrievalError, ValidationError
-from src.model import ChatModel, ChatRequest, ChatResponse, FallbackExecutor, FallbackResult
-from src.observability import get_logger
+from exceptions import ModelInvocationError, RetrievalError, ValidationError
+from model import ChatModel, ChatRequest, ChatResponse, FallbackExecutor, FallbackResult
+from observability import get_logger
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.model.embedding import EmbeddingModel
-    from src.rag.agent_events import AgentAuditTrail
-    from src.rag.retrieval import RetrievalPipeline
-    from src.rag.types import RetrievedContext
-    from src.settings import GuardrailsSettings, RetrievalSettings
+    from model.embedding import EmbeddingModel
+    from rag.agent_events import AgentAuditTrail
+    from rag.retrieval import RetrievalPipeline
+    from rag.types import RetrievedContext
+    from settings import GuardrailsSettings, RetrievalSettings
 
 logger = get_logger(__name__)
 

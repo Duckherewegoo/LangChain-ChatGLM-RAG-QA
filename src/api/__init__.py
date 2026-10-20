@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import typing
 
-from src.api.middleware import ErrorEnvelope, RequestContext, map_exception
-from src.api.schemas import (
+from api.middleware import ErrorEnvelope, RequestContext, map_exception
+from api.schemas import (
     AgentRequestBody,
     AgentResponseBody,
     AgentToolCallView,
@@ -26,13 +26,13 @@ from src.api.schemas import (
 
 if typing.TYPE_CHECKING:
     # 仅向静态分析器声明 create_app 的存在，运行时不执行。
-    from src.api.server import create_app
+    from api.server import create_app
 
 
 def __getattr__(name: str) -> typing.Any:
     """按需加载应用装配入口，避免导入类型时拉起重型依赖。"""
     if name == "create_app":
-        from src.api.server import create_app
+        from api.server import create_app
 
         return create_app
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -10,7 +10,7 @@ import typing
 
 from pydantic import BaseModel, Field
 
-from src.exceptions import CollectionCompatibilityError
+from exceptions import CollectionCompatibilityError
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from collections.abc import Sequence

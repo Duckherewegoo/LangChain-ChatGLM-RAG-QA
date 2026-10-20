@@ -11,7 +11,7 @@ import logging
 import re
 import typing
 
-from src.api.schemas import (
+from api.schemas import (
     AnswerRequestBody,
     AnswerResponseBody,
     CitationView,
@@ -19,13 +19,13 @@ from src.api.schemas import (
     HealthResponseBody,
     RetrievedDocumentView,
 )
-from src.exceptions import ConfigurationError
-from src.model import ProviderHealth
-from src.model.health import check_chain
-from src.rag.container import Container
-from src.rag.agent import AgentRequest, AgentResponse
-from src.rag.orchestrator import OrchestratorRequest
-from src.rag.service import AnswerRequest
+from exceptions import ConfigurationError
+from model import ProviderHealth
+from model.health import check_chain
+from rag.container import Container
+from rag.agent import AgentRequest, AgentResponse
+from rag.orchestrator import OrchestratorRequest
+from rag.service import AnswerRequest
 
 logger = logging.getLogger(__name__)
 

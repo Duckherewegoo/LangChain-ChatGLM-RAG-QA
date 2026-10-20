@@ -13,11 +13,11 @@ import typing
 
 from pydantic import BaseModel
 
-from src.exceptions import ConfigurationError, IngestError
+from exceptions import ConfigurationError, IngestError
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.model.embedding import EmbeddingModel
-    from src.settings import VectorStoreSettings
+    from model.embedding import EmbeddingModel
+    from settings import VectorStoreSettings
 
 _FINGERPRINT_VERSION = 1
 _SAFE_NAME = re.compile(r"[^a-zA-Z0-9_\-]")

@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from src.api.handlers import (
+from api.handlers import (
     _build_health,
     _build_model_health,
     _ensure_vector_store,
@@ -18,8 +18,8 @@ from src.api.handlers import (
     _sse,
     _to_answer_request,
 )
-from src.api.middleware import map_exception
-from src.api.schemas import (
+from api.middleware import map_exception
+from api.schemas import (
     AgentRequestBody,
     AgentResponseBody,
     AgentToolCallView,
@@ -32,8 +32,8 @@ from src.api.schemas import (
     MessageResponseBody,
     RetrievedDocumentView,
 )
-from src.exceptions import RAGError, ResourceNotFoundError, ValidationError
-from src.observability import (
+from exceptions import RAGError, ResourceNotFoundError, ValidationError
+from observability import (
     collect_metrics,
     configure_observability,
     finish_request,
@@ -42,11 +42,11 @@ from src.observability import (
     request_id,
     start_request,
 )
-from src.rag.agent import AgentRequest
-from src.rag.agent_events import AgentEventType
-from src.rag.container import Container, get_container
-from src.rag.service import AnswerRequest
-from src.settings import load_settings
+from rag.agent import AgentRequest
+from rag.agent_events import AgentEventType
+from rag.container import Container, get_container
+from rag.service import AnswerRequest
+from settings import load_settings
 
 logger = get_logger(__name__)
 

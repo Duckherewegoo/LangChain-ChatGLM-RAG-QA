@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import typing
 
-from src.model.errors import ModelConfigurationError
-from src.model.protocol import ChatModel, ChatRequest, ChatResponse
-from src.model.registry import register_provider
+from model.errors import ModelConfigurationError
+from model.protocol import ChatModel, ChatRequest, ChatResponse
+from model.registry import register_provider
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from collections.abc import Sequence
 
-    from src.settings import ModelChatSettings
+    from settings import ModelChatSettings
 
 _PLACEHOLDER_MESSAGE = (
     "提供者 {provider} 尚未实现。"

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import typing
 
-from src.model.protocol import ChatModel
-from src.observability import get_logger
+from model.protocol import ChatModel
+from observability import get_logger
 
 from .fusers import DeduplicatingFuser, ReciprocalRankFusion, ResultFuser, ScoreWeightedFuser
 from .rewriters import ExpansionRewriter, IdentityRewriter, LLMQueryRewriter, QueryRewriter

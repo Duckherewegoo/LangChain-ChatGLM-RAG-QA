@@ -6,14 +6,14 @@
 import typing
 
 if typing.TYPE_CHECKING:
-    from src.model.embedding import (
+    from model.embedding import (
         EmbedderHealth,
         EmbeddingModel,
         create_embedding_model,
         describe_embedding_health,
         stable_hash,
     )
-    from src.model.errors import (
+    from model.errors import (
         ClassifiedError,
         ModelAPIConnectionError,
         ModelAuthenticationError,
@@ -25,24 +25,24 @@ if typing.TYPE_CHECKING:
         classify_model_error,
         is_retryable,
     )
-    from src.model.fallback import FallbackAttempt, FallbackExecutor, FallbackResult
-    from src.model.health import (
+    from model.fallback import FallbackAttempt, FallbackExecutor, FallbackResult
+    from model.health import (
         HealthReport,
         ProviderHealth,
         check_chain,
         check_provider,
         select_provider,
     )
-    from src.model.manager import (
+    from model.manager import (
         ProviderFactory,
         create_chat_model,
     )
-    from src.model.protocol import (
+    from model.protocol import (
         ChatModel,
         ChatRequest,
         ChatResponse,
     )
-    from src.model.registry import (
+    from model.registry import (
         available_providers,
         clear_registry,
         is_registered,
@@ -50,12 +50,12 @@ if typing.TYPE_CHECKING:
         register_provider,
         resolve_factory,
     )
-    from src.model.router import (
+    from model.router import (
         ModelRoute,
         ModelRouter,
         select_fallback_chain,
     )
-    from src.model.routing_types import (
+    from model.routing_types import (
         ModelCapabilitySettings,
         ModelRouterSettings,
         ModelRoutingEntry,
@@ -66,19 +66,19 @@ if typing.TYPE_CHECKING:
 def __getattr__(name: str) -> typing.Any:
     """PEP 562 惰性加载实现。
     
-    防止在仅仅导入 src.model 时触发整个模型层及重型依赖的全量加载，
+    防止在仅仅导入 model 时触发整个模型层及重型依赖的全量加载，
     同时避免潜在的循环导入死锁。
     """
     if name in ("ChatModel", "ChatRequest", "ChatResponse"):
-        from src.model.protocol import ChatModel, ChatRequest, ChatResponse
+        from model.protocol import ChatModel, ChatRequest, ChatResponse
         return locals()[name]
 
     if name in ("ProviderFactory", "create_chat_model"):
-        from src.model.manager import ProviderFactory, create_chat_model
+        from model.manager import ProviderFactory, create_chat_model
         return locals()[name]
 
     if name in ("EmbedderHealth", "EmbeddingModel", "create_embedding_model", "describe_embedding_health", "stable_hash"):
-        from src.model.embedding import (
+        from model.embedding import (
             EmbedderHealth,
             EmbeddingModel,
             create_embedding_model,
@@ -88,7 +88,7 @@ def __getattr__(name: str) -> typing.Any:
         return locals()[name]
 
     if name in ("ClassifiedError", "ModelAPIConnectionError", "ModelAuthenticationError", "ModelConfigurationError", "ModelContentPolicyError", "ModelPayloadError", "ModelRateLimitError", "ModelTimeoutError", "classify_model_error", "is_retryable"):
-        from src.model.errors import (
+        from model.errors import (
             ClassifiedError,
             ModelAPIConnectionError,
             ModelAuthenticationError,
@@ -103,15 +103,15 @@ def __getattr__(name: str) -> typing.Any:
         return locals()[name]
 
     if name in ("FallbackAttempt", "FallbackExecutor", "FallbackResult"):
-        from src.model.fallback import FallbackAttempt, FallbackExecutor, FallbackResult
+        from model.fallback import FallbackAttempt, FallbackExecutor, FallbackResult
         return locals()[name]
 
     if name in ("HealthReport", "ProviderHealth", "check_chain", "check_provider", "select_provider"):
-        from src.model.health import HealthReport, ProviderHealth, check_chain, check_provider, select_provider
+        from model.health import HealthReport, ProviderHealth, check_chain, check_provider, select_provider
         return locals()[name]
 
     if name in ("available_providers", "clear_registry", "is_registered", "register_alias", "register_provider", "resolve_factory"):
-        from src.model.registry import (
+        from model.registry import (
             available_providers,
             clear_registry,
             is_registered,
@@ -122,11 +122,11 @@ def __getattr__(name: str) -> typing.Any:
         return locals()[name]
 
     if name in ("ModelRoute", "ModelRouter", "select_fallback_chain"):
-        from src.model.router import ModelRoute, ModelRouter, select_fallback_chain
+        from model.router import ModelRoute, ModelRouter, select_fallback_chain
         return locals()[name]
 
     if name in ("ModelCapabilitySettings", "ModelRouterSettings", "ModelRoutingEntry", "UseCaseBinding"):
-        from src.model.routing_types import ModelCapabilitySettings, ModelRouterSettings, ModelRoutingEntry, UseCaseBinding
+        from model.routing_types import ModelCapabilitySettings, ModelRouterSettings, ModelRoutingEntry, UseCaseBinding
         return locals()[name]
 
     raise AttributeError(f"模块 {__name__!r} 没有属性 {name!r}")

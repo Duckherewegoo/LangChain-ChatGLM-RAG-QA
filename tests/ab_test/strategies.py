@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import typing
 
-from src.model.fallback import FallbackExecutor
-from src.rag.orchestrator import AgentOrchestrator
-from src.rag.reviewer import AnswerReviewer
-from src.rag.tools import ToolRegistry
-from src.settings import AgentSettings, GuardrailsSettings, ReviewSettings
+from model.fallback import FallbackExecutor
+from rag.orchestrator import AgentOrchestrator
+from rag.reviewer import AnswerReviewer
+from rag.tools import ToolRegistry
+from settings import AgentSettings, GuardrailsSettings, ReviewSettings
 
 StrategyBuilder = typing.Callable[[typing.Any, typing.Any], AgentOrchestrator]
 

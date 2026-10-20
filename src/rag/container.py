@@ -11,27 +11,27 @@ from __future__ import annotations
 
 import typing
 
-from src.data_process.pipeline import IngestPipeline
-from src.exceptions import ConfigurationError
-from src.model import (
+from data_process.pipeline import IngestPipeline
+from exceptions import ConfigurationError
+from model import (
     ChatModel,
     EmbeddingModel,
     FallbackExecutor,
     ModelRouter,
     create_embedding_model,
 )
-from src.observability import get_logger
-from src.rag.agent import AgentRunner, create_agent_runner
-from src.rag.collection_policy import (
+from observability import get_logger
+from rag.agent import AgentRunner, create_agent_runner
+from rag.collection_policy import (
     CollectionCompatibilityError,
     create_collection_policy,
     fingerprint_embedder,
 )
-from src.rag.orchestrator import AgentOrchestrator
-from src.rag.retrieval import RetrievalPipeline
-from src.rag.reviewer import AnswerReviewer
-from src.rag.service import RAGService
-from src.rag.strategies import (
+from rag.orchestrator import AgentOrchestrator
+from rag.retrieval import RetrievalPipeline
+from rag.reviewer import AnswerReviewer
+from rag.service import RAGService
+from rag.strategies import (
     HybridRetrieval,
     QueryRewriter,
     RetrievalStrategy,
@@ -39,12 +39,12 @@ from src.rag.strategies import (
     create_fuser,
     create_query_rewriter,
 )
-from src.rag.tools import Guardrails, ToolRegistry, create_rag_tool_registry
-from src.rag.vector_store import VectorStore, create_vector_store
+from rag.tools import Guardrails, ToolRegistry, create_rag_tool_registry
+from rag.vector_store import VectorStore, create_vector_store
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.rag.strategies import InMemoryBM25Index
-    from src.settings import AppSettings
+    from rag.strategies import InMemoryBM25Index
+    from settings import AppSettings
 
 logger = get_logger(__name__)
 
@@ -181,7 +181,7 @@ class Container:
         return self._strategies
 
     def _build_keyword_strategy(self) -> RetrievalStrategy | None:
-        from src.rag.strategies import InMemoryBM25Index, KeywordRetrievalStrategy
+        from rag.strategies import InMemoryBM25Index, KeywordRetrievalStrategy
 
         cfg = self._settings.retrieval.keyword
         if not cfg.enabled:
@@ -261,7 +261,7 @@ class Container:
 
     def ingest_pipeline(self) -> IngestPipeline:
         if self._ingest_pipeline is None:
-            from src.data_process.pipeline import DocumentChunker, DocumentLoader
+            from data_process.pipeline import DocumentChunker, DocumentLoader
 
             loader = DocumentLoader(self._settings.ingest.supported_extensions)
             chunker = DocumentChunker(
@@ -356,7 +356,7 @@ class Container:
         )
         stored_dimension = store.dimension()
         try:
-            from src.rag.collection_policy import validate_compatibility
+            from rag.collection_policy import validate_compatibility
 
             validate_compatibility(policy, fingerprint, stored_dimension)
         except CollectionCompatibilityError:
@@ -375,7 +375,7 @@ class Container:
 
 def _legacy_router_settings(settings: AppSettings) -> typing.Any:
     """从旧版聊天设置构建单模型路由器配置。"""
-    from src.model.routing_types import (
+    from model.routing_types import (
         ModelCapabilitySettings,
         ModelRouterSettings,
         ModelRoutingEntry,
@@ -412,7 +412,7 @@ def initialize_container(settings: AppSettings | None = None) -> Container:
     """创建或替换进程级容器。"""
     global _container
 
-    from src.settings import load_settings
+    from settings import load_settings
 
     if settings is None:
         settings = load_settings()

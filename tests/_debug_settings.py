@@ -2,7 +2,7 @@ import sys
 
 sys.path.insert(0, ".")
 import traceback
-from src.settings import AppSettings
+from settings import AppSettings
 
 try:
     # 使用 model_validate 接收完整字典，绕过 Pyright 对嵌套子模型的静态检查，

@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, ValidationError
 
-from src.model.routing_types import ModelEmbeddingSettings, ModelRouterSettings
+from model.routing_types import ModelEmbeddingSettings, ModelRouterSettings
 
 
 class ModelChatSettings(BaseModel):

@@ -16,7 +16,7 @@ import typing
 
 import httpx
 
-from src.model.errors import (
+from model.errors import (
     ModelAPIConnectionError,
     ModelAuthenticationError,
     ModelConfigurationError,
@@ -26,11 +26,11 @@ from src.model.errors import (
     ModelTimeoutError,
     is_retryable,
 )
-from src.model.protocol import ChatModel, ChatRequest, ChatResponse
-from src.observability import get_logger
+from model.protocol import ChatModel, ChatRequest, ChatResponse
+from observability import get_logger
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from src.settings import ModelChatSettings
+    from settings import ModelChatSettings
 
 logger = get_logger(__name__)
 
