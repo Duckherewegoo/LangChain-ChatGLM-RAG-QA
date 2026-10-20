@@ -1,5 +1,5 @@
 [project]
-name = "enterprise-rag-chatglm"
+name = "langchain-chatglm-rag-qa"
 version = "0.2.0"
 description = "Configurable enterprise retrieval-augmented generation assistant with LangChain, LangGraph, and a pluggable ChatGLM model adapter."
 readme = "README.md"
@@ -47,8 +47,9 @@ mcp = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Duckherewegoo/enterprise-rag-chatglm"
-Repository = "https://github.com/Duckherewegoo/enterprise-rag-chatglm.git"
+Homepage = "https://github.com/Duckherewegoo/LangChain-ChatGLM-RAG-QA"
+Repository = "https://github.com/Duckherewegoo/LangChain-ChatGLM-RAG-QA.git"
+Issues = "https://github.com/Duckherewegoo/LangChain-ChatGLM-RAG-QA/issues"
 
 [dependency-groups]
 dev = [
@@ -72,7 +73,7 @@ packages = ["src"]
 [tool.ruff]
 line-length = 130
 target-version = "py310"
-extend-exclude = ["data", "build", "dist", "tests"]
+extend-exclude = ["data", "build", "dist"]
 
 [tool.ruff.lint]
 select = [
