@@ -207,7 +207,7 @@ enterprise-rag-chatglm/
 ├── data/
 │   ├── index/                   # 向量索引存储（已排除，见 .gitignore）
 │   └── raw/                    # 原始文档（已排除，见 .gitignore）
-├── docs/                       # 补充文档
+├── docs/adr                       # ADR架构文档
 ├── src/
 │   ├── main.py                 # 入口
 │   ├── api/                    # FastAPI 层
@@ -255,7 +255,6 @@ enterprise-rag-chatglm/
 └── README.md
 ```
 
-> 目录树已按 `.gitignore` 的排除规则精简：`__pycache__/`、`data/index/*`、`data/raw/*`、`.env`、测试缓存等不再列出。被忽略的目录仅保留结构说明，其下实际内容不进入版本库。
 
 ### 源码一览
 
