@@ -6,16 +6,16 @@ import asyncio
 import contextlib
 import importlib.util
 import json
-import logging
 import os
 import threading
 import typing
 
+from base.observability import get_logger
 from rag.tool_types import ToolContext, ToolSpec
 
 from .base import ToolExecutionError, ToolSource
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _mcp_available() -> bool:
@@ -25,11 +25,14 @@ def _mcp_available() -> bool:
 class _MCPBackgroundLoop:
     """为同步环境托管的常驻 asyncio 事件循环。"""
     _instance: _MCPBackgroundLoop | None = None
+    _lock = threading.Lock()
 
     @classmethod
     def get(cls) -> _MCPBackgroundLoop:
         if cls._instance is None:
-            cls._instance = cls()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
         return cls._instance
 
     def __init__(self) -> None:
@@ -39,12 +42,20 @@ class _MCPBackgroundLoop:
 
     def _run(self) -> None:
         asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        try:
+            self._loop.run_forever()
+        except Exception:
+            logger.exception("MCP 事件循环异常退出")
 
-    def run_coro(self, coro: typing.Coroutine) -> typing.Any:
-        """将协程提交到常驻循环并等待结果。"""
+    def run_coro(
+        self,
+        coro: typing.Coroutine[typing.Any, typing.Any, typing.Any],
+        *,
+        timeout: float | None = None,
+    ) -> typing.Any:
+        """将协程提交到常驻循环并等待结果；timeout 为 None 时无限等待。"""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result()
+        return future.result(timeout=timeout)
 
 
 class MCPToolSource(ToolSource):
@@ -67,7 +78,7 @@ class MCPToolSource(ToolSource):
         self._args = list(args or [])
         self._env = dict(env or {})
         self._label = name or f"mcp:{command}"
-        self._timeout = max(float(timeout_seconds), 0.1)
+        self._timeout = max(float(timeout_seconds), 0.1)  # 会话启动/列出/调用共用
 
         self._specs: list[ToolSpec] | None = None
         self._loop = _MCPBackgroundLoop.get()
@@ -97,12 +108,12 @@ class MCPToolSource(ToolSource):
                 session = await stack.enter_async_context(ClientSession(read, write))
                 await session.initialize()
                 return session, stack
-            except Exception as exc:
+            except Exception:
                 await stack.aclose()
-                raise exc
+                raise
 
         try:
-            session, stack = self._loop.run_coro(_async_connect())
+            session, stack = self._loop.run_coro(_async_connect(), timeout=self._timeout)
             self._session = session
             self._exit_stack = stack
             logger.info(f"MCP 会话启动成功: {self._label}")
@@ -112,17 +123,19 @@ class MCPToolSource(ToolSource):
             raise ToolExecutionError(f"启动 MCP 服务端失败: {exc}", retryable=True) from exc
 
     def list_specs(self) -> list[ToolSpec]:
+        """返回工具列表；首次调用后缓存，MCP 服务端变更需重建 source。"""
         if self._specs is not None:
             return self._specs
 
         self._start_session_sync()
-        assert self._session is not None
+        if self._session is None:
+            raise ToolExecutionError(f"MCP 会话未初始化: {self._label}", retryable=True)
 
         async def _list():
             return await self._session.list_tools()
 
         try:
-            result = self._loop.run_coro(_list())
+            result = self._loop.run_coro(_list(), timeout=self._timeout)
         except Exception as exc:
             raise ToolExecutionError(f"获取 MCP 工具列表失败: {exc}", retryable=True) from exc
 
@@ -145,13 +158,14 @@ class MCPToolSource(ToolSource):
         context: ToolContext | None = None,
     ) -> typing.Any:
         self._start_session_sync()
-        assert self._session is not None
+        if self._session is None:
+            raise ToolExecutionError(f"MCP 会话未初始化: {self._label}", retryable=True)
 
         async def _call():
             return await self._session.call_tool(name, arguments or {})
 
         try:
-            result = self._loop.run_coro(_call())
+            result = self._loop.run_coro(_call(), timeout=self._timeout)
         except Exception as exc:
             raise ToolExecutionError(f"MCP 工具 {name!r} 调用失败: {exc}", tool=name, retryable=True) from exc
 
@@ -165,9 +179,15 @@ class MCPToolSource(ToolSource):
                 except Exception as e:
                     logger.warning(f"关闭 MCP 会话时出现异常: {e}")
 
-            self._loop.run_coro(_cleanup())
-            self._session = None
-            self._exit_stack = None
+            # 关闭用短超时：服务端挂死时不应拖住整个关闭流程。
+            # 超时/失败时仍强制清空状态字段，避免下次复用已损坏的 session。
+            try:
+                self._loop.run_coro(_cleanup(), timeout=5.0)
+            except Exception as exc:
+                logger.warning(f"MCP 会话关闭超时或失败，强制清理状态: {exc}")
+            finally:
+                self._session = None
+                self._exit_stack = None
             logger.info(f"MCP 会话已关闭: {self._label}")
 
     def __repr__(self) -> str:
