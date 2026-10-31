@@ -212,8 +212,39 @@ def create_rag_tool_registry(service: "RAGService") -> ToolRegistry:
         from rag.service import AnswerRequest
 
         safe_arguments = dict(arguments or {})
-        safe_arguments.setdefault("tenant_id", context.tenant_id)
-        safe_arguments.setdefault("owner_id", context.owner_id)
+
+        # tenant_id / owner_id 是硬约束：模型可以传（用于显式指定），但不能
+        # 超出调用方上下文。arguments 由模型生成，不可信；context 才是可信来源。
+        requested_tenant = safe_arguments.get("tenant_id")
+        if requested_tenant is not None and requested_tenant != context.tenant_id:
+            logger.warning(
+                "工具请求 tenant_id 越权 | context=%s | requested=%s",
+                context.tenant_id,
+                requested_tenant,
+            )
+            raise PermissionDeniedError(
+                "工具请求的 tenant_id 与调用方上下文不一致。",
+                details={"context_tenant_id": context.tenant_id},
+            )
+        safe_arguments["tenant_id"] = context.tenant_id
+
+        if context.owner_id is not None:
+            requested_owner = safe_arguments.get("owner_id")
+            if requested_owner is not None and requested_owner != context.owner_id:
+                logger.warning(
+                    "工具请求 owner_id 越权 | context=%s | requested=%s",
+                    context.owner_id,
+                    requested_owner,
+                )
+                raise PermissionDeniedError(
+                    "工具请求的 owner_id 与调用方上下文不一致。",
+                    details={"context_owner_id": context.owner_id},
+                )
+            safe_arguments["owner_id"] = context.owner_id
+        # context.owner_id 为 None 时（租户级访问），不强制 owner；
+        # 模型传的 owner_id 原样保留（作为额外缩小条件），tenant_id 已锁死，
+        # 不会产生跨租户泄露。
+
         if context.allowed_sources:
             requested = safe_arguments.get("allowed_sources") or []
             if requested:
@@ -235,7 +266,6 @@ def create_rag_tool_registry(service: "RAGService") -> ToolRegistry:
             "document_count": len(result.documents),
             "documents": [_document_summary(document) for document in result.documents],
         }
-
     def list_sources(
         arguments: dict[str, typing.Any], context: ToolContext
     ) -> dict[str, typing.Any]:
