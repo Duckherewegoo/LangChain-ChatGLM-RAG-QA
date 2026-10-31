@@ -2,10 +2,23 @@
 
 这一层刻意保持极薄：校验传输契约、附加可观测性上下文、委托业务逻辑给容器。
 它不导入提供者 SDK，也不实现检索算法。
+
+两条问答路径并存：
+    - /v1/answer、/v1/agent → 手写多角色编排器（含审核，无 LangGraph）；
+    - /v1/agent/stream → LangGraph 智能体（无审核，流式输出）。
+二者互不调用。需要审核走 /v1/agent；需要流式走 /v1/agent/stream。
+
+安全说明（待补齐）：
+    /v1/ingest 接收客户端提供的文件路径，未做路径白名单校验；
+    /v1/documents DELETE 未做鉴权，tenant_id 由客户端填写。
+    暴露到公网前必须补齐——本文件只标注，不实现。
 """
 
 from __future__ import annotations
-from importlib.metadata import version
+import asyncio
+import typing
+import uuid
+from importlib.metadata import PackageNotFoundError, version
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,11 +63,72 @@ from rag.service import AnswerRequest
 from settings import load_settings
 
 logger = get_logger(__name__)
-value = version("langchain-chatglm-rag-qa")
+
+
+def _package_version() -> str:
+    """读取包版本；包未安装时回退到开发版本号。
+
+    模块顶层直接 version() 在未 pip install -e 的开发环境会抛
+    PackageNotFoundError，导致 import api.server 即崩。
+    """
+    try:
+        return version("langchain-chatglm-rag-qa")
+    except PackageNotFoundError:
+        return "0.0.0-dev"
+
+
+value = _package_version()
+
+
+_CITATION_ALLOWED_FIELDS = {"index", "source", "title", "page", "chunk_id", "score"}
+
+
+def _citation_view(item: typing.Any) -> CitationView:
+    """把 pydantic 对象或 dict 统一映射为 CitationView。
+
+    /v1/answer 的 service 返回 pydantic 对象，/v1/agent 的编排器返回 dict，
+    两条路径此前各自处理，容易漂移。统一在这里做白名单过滤，避免字段
+    不匹配导致的 500。
+    """
+    raw = item.model_dump() if hasattr(item, "model_dump") else dict(item)
+    return CitationView(**{k: v for k, v in raw.items() if k in _CITATION_ALLOWED_FIELDS})
+
+
+def _to_agent_request(body: AgentRequestBody) -> AgentRequest:
+    """把 API 请求映射为 AgentRequest（/v1/agent 与 /v1/agent/stream 共用）。
+
+    request_id 透传中间件捕获的 X-Request-Id；缺失时生成 uuid4，保证
+    /v1/agent 的 trail 与客户端日志使用同一个 ID。
+    """
+    return AgentRequest(
+        question=body.question.strip(),
+        tenant_id=body.tenant_id,
+        owner_id=body.owner_id,
+        allowed_sources=body.allowed_sources,
+        history=body.history,
+        additional_context=body.additional_context,
+        use_case=body.use_case,
+        request_id=request_id() or uuid.uuid4().hex,
+    )
+
+
+def _next_or_none(iterator: typing.Iterator[typing.Any]) -> tuple[bool, typing.Any]:
+    """从同步迭代器拉一个元素；结束返回 (False, None)。
+
+    用于把同步生成器包装成异步流；asyncio.to_thread 不接受 StopIteration，
+    所以用哨兵把「有值/结束」显式区分。
+    """
+    try:
+        return True, next(iterator)
+    except StopIteration:
+        return False, None
+
 
 def create_app(container: Container | None = None) -> FastAPI:
     """创建并配置 FastAPI 应用。"""
-    settings = load_settings()
+    # 注（M3）：get_container 内部也会 load_settings()；此处先 load 是为了
+    # 在容器初始化前配置 observability。若 container 已传入则复用其 settings。
+    settings = container.settings if container is not None else load_settings()
     configure_observability(settings.log_level, settings.observability.metrics_enabled)
     dependencies = container or get_container()
 
@@ -74,7 +148,10 @@ def create_app(container: Container | None = None) -> FastAPI:
     )
 
     @app.middleware("http")
-    async def request_context_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
+    async def request_context_middleware(
+        request: Request,
+        call_next: typing.Callable[[Request], typing.Awaitable[Response]],
+    ) -> Response:
         correlation_id = start_request(request.headers.get("X-Request-Id"))
         endpoint = f"{request.method} {request.url.path}"
         request_latency = get_metric("request_latency")
@@ -134,7 +211,12 @@ def create_app(container: Container | None = None) -> FastAPI:
     async def metrics_endpoint() -> Response:
         payload = collect_metrics()
         if payload is None:
-            return PlainTextResponse("# Prometheus client 未安装\n", media_type="text/plain")
+            # 503 让 K8s / Prometheus 认为端点不健康，避免监控盲区
+            return PlainTextResponse(
+                "# Prometheus client 未安装\n",
+                status_code=503,
+                media_type="text/plain",
+            )
         return PlainTextResponse(
             payload.decode("utf-8"), media_type="text/plain; version=0.0.4"
         )
@@ -151,7 +233,7 @@ def create_app(container: Container | None = None) -> FastAPI:
         return AnswerResponseBody(
             answer=result.answer,
             query=result.query,
-            citations=[CitationView(**c.model_dump()) for c in result.citations],
+            citations=[_citation_view(c) for c in result.citations],
             documents=[
                 RetrievedDocumentView(**d.model_dump())
                 for d in result.context.documents
@@ -168,17 +250,21 @@ def create_app(container: Container | None = None) -> FastAPI:
     async def retrieve(
         question: str,
         tenant_id: str = "default",
-        top_k: int = 8,
+        top_k: int | None = None,
         owner_id: str | None = None,
     ) -> AnswerResponseBody:
         dependencies.guardrails().check_question(question)
         service = dependencies.rag_service()
+        # top_k 未指定时用 settings 默认，避免与 RetrievalSettings.top_k 漂移
+        effective_top_k = (
+            top_k if top_k is not None else dependencies.settings.retrieval.top_k
+        )
         result = service.retrieve_only(
             AnswerRequest(
                 question=question,
                 tenant_id=tenant_id,
                 owner_id=owner_id,
-                top_k=top_k,
+                top_k=effective_top_k,
             )
         )
         return AnswerResponseBody(
@@ -196,29 +282,25 @@ def create_app(container: Container | None = None) -> FastAPI:
     @app.post("/v1/agent", response_model=AgentResponseBody)
     async def run_agent(body: AgentRequestBody) -> AgentResponseBody:
         dependencies.guardrails().check_question(body.question)
-        runtime_request = AgentRequest(
-            question=body.question.strip(),
-            tenant_id=body.tenant_id,
-            owner_id=body.owner_id,
-            allowed_sources=body.allowed_sources,
-            history=body.history,
-            additional_context=body.additional_context,
-            use_case=body.use_case,
-        )
+        runtime_request = _to_agent_request(body)
         response = await _run_via_orchestrator(
             dependencies, runtime_request, body.additional_context
         )
 
         # trail_store 是 Container 的属性，不是 AgentRunner 的
+        # 注（P1-4）：只有本端点写 trail_store；/v1/answer 与 /v1/agent/stream
+        # 不写，因此 get_agent_trail 对后两者返回 404。
         dependencies.trail_store.put(response.request_id, response.trail)
 
         return AgentResponseBody(
             request_id=response.request_id,
             answer=response.answer,
-            citations=response.citations,
+            citations=[_citation_view(item) for item in response.citations],
             tool_calls=[
                 AgentToolCallView(**call.model_dump()) for call in response.tool_calls
             ],
+            # 注（M6）：orchestrator 不调工具，tool_calls 恒为空；
+            # attempted_models / fallback_used 也恒为默认值（见 handlers 的 TODO）。
             iterations=response.iterations,
             stopped_reason=response.stopped_reason,
             model=response.model,
@@ -230,15 +312,7 @@ def create_app(container: Container | None = None) -> FastAPI:
     @app.post("/v1/agent/stream")
     async def stream_agent(body: AgentRequestBody):
         dependencies.guardrails().check_question(body.question)
-        runtime_request = AgentRequest(
-            question=body.question.strip(),
-            tenant_id=body.tenant_id,
-            owner_id=body.owner_id,
-            allowed_sources=body.allowed_sources,
-            history=body.history,
-            additional_context=body.additional_context,
-            use_case=body.use_case,
-        )
+        runtime_request = _to_agent_request(body)
         runner = dependencies.agent_runner()
 
         async def event_stream():
@@ -248,9 +322,14 @@ def create_app(container: Container | None = None) -> FastAPI:
                     "request_id": runtime_request.request_id,
                 }
             )
+            # P0-4：runner.stream 是同步生成器，直接在 async 里 for 会阻塞事件循环。
+            # 用 asyncio.to_thread 逐条拉取，把「计算下一条」丢到线程池。
+            iterator = runner.stream(runtime_request)
             try:
-                # runner.stream 是同步生成器
-                for event in runner.stream(runtime_request):
+                while True:
+                    has_next, event = await asyncio.to_thread(_next_or_none, iterator)
+                    if not has_next:
+                        break
                     yield _sse(event)
             except ValidationError as exc:
                 yield _sse(
@@ -261,6 +340,7 @@ def create_app(container: Container | None = None) -> FastAPI:
                     }
                 )
             except Exception as exc:
+                # P1-5：SSE 无 HTTP status，_code 被丢弃，用 error_code 替代
                 _code, envelope = map_exception(
                     exc, request_id=runtime_request.request_id
                 )
@@ -284,7 +364,10 @@ def create_app(container: Container | None = None) -> FastAPI:
     @app.post("/v1/ingest", response_model=IngestResponseBody)
     async def ingest(body: IngestRequestBody) -> IngestResponseBody:
         pipeline = dependencies.ingest_pipeline()
-        stats = pipeline.ingest_path(
+        # P0-2 待补：body.path 未做路径白名单校验，暴露公网前必须修。
+        # M4：ingest_path 是同步大文件操作，提交到线程池，避免阻塞事件循环。
+        stats = await asyncio.to_thread(
+            pipeline.ingest_path,
             body.path,
             tenant_id=body.tenant_id,
             owner_id=body.owner_id,
@@ -307,7 +390,10 @@ def create_app(container: Container | None = None) -> FastAPI:
         document_id: str, tenant_id: str = "default"
     ) -> MessageResponseBody:
         pipeline = dependencies.ingest_pipeline()
-        removed = pipeline.remove_document(document_id, tenant_id)
+        # P0-3 待补：无鉴权，tenant_id 由客户端填写，暴露公网前必须修。
+        removed = await asyncio.to_thread(
+            pipeline.remove_document, document_id, tenant_id
+        )
         return MessageResponseBody(
             status="deleted",
             message=f"已删除文档 {document_id} 的 {removed} 个文本块。",
