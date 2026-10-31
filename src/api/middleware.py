@@ -3,18 +3,20 @@
 本模块将 Python 内置异常、Pydantic 校验错误以及项目领域异常翻译为结构化的
 JSON 响应。它必须绝不让原始堆栈或密钥材料流向客户端。对于瞬态的基建错误，
 返回安全的通用提示；每个响应都附带与当前请求关联的追踪 ID。
+
+注意：`ValueError → 400` 分支只服务真正的请求参数校验；启动期配置错误应抛
+`ConfigurationError`，不要用 `ValueError`，否则会被误映射为客户端错误。
 """
 
 from __future__ import annotations
 
 import re
 import typing
-import uuid
 
 from pydantic import BaseModel, Field
 
 from base.exceptions import RAGError
-from base.observability import get_logger, start_request
+from base.observability import get_logger
 
 logger = get_logger(__name__)
 
@@ -30,18 +32,6 @@ class ErrorEnvelope(BaseModel):
     request_id: str | None = None
 
 
-class RequestContext(BaseModel):
-    """请求关联与追踪上下文。"""
-
-    request_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
-    user_id: str | None = None
-    tenant_id: str | None = "default"
-
-    def bind(self) -> None:
-        """将当前上下文绑定到执行作用域。"""
-        start_request(self.request_id)
-
-
 def map_exception(exc: BaseException, *, request_id: str | None = None) -> tuple[int, ErrorEnvelope]:
     """将任意异常映射为稳定的 HTTP 响应信封（状态码 + 响应体）。"""
 
@@ -54,9 +44,11 @@ def map_exception(exc: BaseException, *, request_id: str | None = None) -> tuple
         )
 
     if isinstance(exc, ValueError):
+        # 仅用于真正的请求参数校验（如空 query）。
+        # 启动期配置错误应抛 ConfigurationError，不要用 ValueError。
         return 400, ErrorEnvelope(
             error="invalid_argument",
-            message=str(exc) or "请求参数无效。",
+            message="请求参数无效。",
             request_id=request_id,
         )
 
@@ -95,8 +87,8 @@ def map_exception(exc: BaseException, *, request_id: str | None = None) -> tuple
             request_id=request_id,
         )
 
-    # 修复语法错误，并确保日志格式兼容
-    logger.exception(f"unexpected_api_error | request_id={request_id}")
+    # FastAPI 异常处理器调用时可能已退出 except 块，显式传异常保留堆栈。
+    logger.opt(exception=exc).error(f"unexpected_api_error | request_id={request_id}")
     return 500, ErrorEnvelope(
         error="internal_error",
         message=_SAFE_INTERNAL_MESSAGE,
@@ -104,16 +96,12 @@ def map_exception(exc: BaseException, *, request_id: str | None = None) -> tuple
     )
 
 
-def ensure_request_id(existing: str | None) -> str:
-    """返回现有的请求 ID，若不存在则生成一个新的。"""
-    return existing or uuid.uuid4().hex
-
-
-# 精确匹配真正的敏感信息字段，防止误伤诸如 max_tokens 等正常字段
-_SENSITIVE_KEYS = frozenset({
-    "api_key", "apikey", "password", "passwd", "secret", "token",
-    "access_token", "refresh_token", "authorization", "credential",
-})
+# 子串匹配敏感键名；误伤 max_tokens / token_count 等字段可接受。
+_SENSITIVE_HINTS = (
+    "api_key", "apikey", "api-key", "token",
+    "secret", "password", "passwd", "authorization",
+    "credential", "bearer",
+)
 
 # 匹配常见的密钥格式（如 sk-...）
 _SECRET_VALUE_PATTERN = re.compile(
@@ -122,20 +110,27 @@ _SECRET_VALUE_PATTERN = re.compile(
 
 
 def _safe_details(details: typing.Any) -> dict[str, typing.Any]:
-    """从错误详情中移除潜在的敏感信息。
+    """递归脱敏错误详情。
 
-    仅对明确敏感键名或符合特定密钥模式的值进行脱敏，避免误伤正常字段。
+    键名含敏感关键词即替换为 [redacted]；字符串值按密钥格式替换；
+    dict / list 递归处理。非 dict 输入返回空 dict。
     """
     if not isinstance(details, dict):
         return {}
-
-    redacted = dict(details)
-    for key, value in list(redacted.items()):
-        if key.lower() in _SENSITIVE_KEYS:
-            redacted[key] = "[redacted]"
-        elif isinstance(value, str):
-            redacted[key] = _SECRET_VALUE_PATTERN.sub("[REDACTED]", value)
-    return redacted
+    return {key: _redact_value(key, value) for key, value in details.items()}
 
 
-__all__ = ["ErrorEnvelope", "RequestContext", "ensure_request_id", "map_exception"]
+def _redact_value(key: str, value: typing.Any) -> typing.Any:
+    """按敏感键名与密钥格式脱敏单个值。"""
+    if isinstance(key, str) and any(hint in key.lower() for hint in _SENSITIVE_HINTS):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return _safe_details(value)
+    if isinstance(value, list):
+        return [_redact_value(key, item) for item in value]
+    if isinstance(value, str):
+        return _SECRET_VALUE_PATTERN.sub("[REDACTED]", value)
+    return value
+
+
+__all__ = ["ErrorEnvelope", "map_exception"]
