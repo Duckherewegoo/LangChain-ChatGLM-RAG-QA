@@ -7,7 +7,7 @@
 from model.providers import (  # noqa: F401 - 仅用于触发注册副作用
     deepseek,
     doubao,
-    openai_compatible,
+    openai_compatible,  # 基类，不注册 provider；显式导入以确保先于子类加载
     qwen,
     zhipu,
 )

@@ -32,6 +32,7 @@ def register_provider(name: str, factory: ProviderFactory) -> None:
         raise TypeError("提供者工厂必须是可调用对象。")
 
     with _registry_lock:
+        # 同一 name 重复注册会覆盖前者；测试用 clear_registry 重置。
         _REGISTRY[name.strip().lower()] = factory
 
 
@@ -46,11 +47,13 @@ def register_alias(alias: str, canonical_name: str) -> None:
                 f"无法将别名 {alias!r} 映射到未注册的提供者 {canonical_name!r}。",
                 details={"alias": alias, "canonical_name": canonical_name},
             )
+        # 同一 alias 重复映射会覆盖前者。
         _ALIASES[key] = target
 
 
 def resolve_factory(provider: str) -> ProviderFactory:
     """返回指定提供者的工厂函数，支持解析别名。"""
+    # 注册期的 TypeError 表示编程错误；解析期的 ConfigurationError 表示配置错误，两者语义不同。
     if not isinstance(provider, str) or not provider.strip():
         raise ConfigurationError(
             "模型提供者必须是非空字符串。",

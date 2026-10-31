@@ -1,7 +1,8 @@
 """模型健康检查与就绪决策。
 
 健康检查负责验证配置，并执行一次轻量级的模型往返通信，
-不执行检索，也不生成大段内容。结果按提供者分组，
+不执行检索，也不生成大段内容。检查是只读的：不修改被检查模型的状态。
+结果按提供者分组，
 并统一通过健康检查端点对外暴露。
 """
 
@@ -13,7 +14,7 @@ import typing
 from pydantic import BaseModel, Field
 
 from model.errors import classify_model_error
-from model.protocol import ChatModel, ChatRequest, ChatResponse
+from model.protocol import ChatModel, ChatRequest
 from observability import get_logger
 
 if typing.TYPE_CHECKING:
@@ -21,15 +22,18 @@ if typing.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# 全局健康检查缓存：记录每个 provider 上次检查的时间和结果
-# 格式: { provider_name: (timestamp, ProviderHealth) }
-_HEALTH_CACHE: dict[str, tuple[float, "ProviderHealth"]] = {}
+# 全局健康检查缓存：key 为 (provider, use_tools)，避免两种检查共用缓存。
+_HEALTH_CACHE: dict[tuple[str, bool], tuple[float, "ProviderHealth"]] = {}
 # 缓存有效期（秒），避免 K8s 探针频繁请求导致消耗真实 API 额度
 _CACHE_TTL = 60.0
 
 
 class ProviderHealth(BaseModel):
-    """单个提供者的健康状态。"""
+    """单个提供者的健康状态。
+
+    provider 是调用方使用的配置模型键（model_router.models 的 key），
+    不一定是底层 provider 名；model_name 是具体模型标识。
+    """
 
     provider: str
     model_name: str
@@ -64,23 +68,20 @@ def check_provider(
     """对单个模型执行轻量级健康检查（带缓存机制）。"""
 
     now = time.perf_counter()
+    cache_key = (provider, use_tools)
 
-    # 检查缓存
-    if not force_refresh and provider in _HEALTH_CACHE:
-        cached_time, cached_health = _HEALTH_CACHE[provider]
-        if now - cached_time < _CACHE_TTL:
-            return cached_health
+    cached = None if force_refresh else _HEALTH_CACHE.get(cache_key)
+    if cached and now - cached[0] < _CACHE_TTL:
+        return cached[1]
 
     started = time.perf_counter()
 
-    # 优先使用协议中定义的 model_name，若没有则回退到 name
-
-    model_name = model.model_name
-    configured = bool(getattr(model, "is_configured", True))
+    # ChatModel 实例存在即意味着构造时已通过配置校验。
+    configured = True
 
     health = ProviderHealth(
         provider=provider,
-        model_name=model_name,
+        model_name=model.model_name,
         configured=configured,
     )
 
@@ -105,29 +106,26 @@ def check_provider(
     )
 
     try:
-        # 如果要求测试工具，则先绑定工具
-        bound_model = model.bind_tools(request.tools) if use_tools else model
-        response = bound_model.invoke(request)
+        # ChatRequest.tools 由 provider 层合并到 payload，无需 bind_tools，避免污染实例。
+        response = model.invoke(request)
     except Exception as exc:
         classified = classify_model_error(exc, provider=provider)
         health.error_type = classified.error_type
         health.error_message = str(exc)
         logger.warning(
-            "model_health_check_failed",
-            provider=provider,
-            error_type=classified.error_type,
-            error=str(exc),
+            f"model_health_check_failed | provider={provider} | "
+            f"error_type={classified.error_type} | error={exc}"
         )
-        _HEALTH_CACHE[provider] = (time.perf_counter(), health)
+        _HEALTH_CACHE[cache_key] = (time.perf_counter(), health)
         return health
 
     health.reachable = True
     health.latency_seconds = time.perf_counter() - started
 
-    # 只有当模型真正返回了工具调用（或者明确没有报错），才认为支持工具
-    health.supports_tools = use_tools and isinstance(response, ChatResponse)
+    # 仅当模型实际返回工具调用时才判为支持工具；ping 为 noop，模型可能不调用。
+    health.supports_tools = bool(response.tool_calls)
 
-    _HEALTH_CACHE[provider] = (time.perf_counter(), health)
+    _HEALTH_CACHE[cache_key] = (time.perf_counter(), health)
     return health
 
 
@@ -168,7 +166,11 @@ def check_chain(
 
 
 def select_provider(report: HealthReport, preferred: str | None) -> str | None:
-    """选择提供者，仅当首选提供者可达时才优先使用。"""
+    """选择提供者，仅当首选提供者可达时才优先使用。
+
+    预留接口：当前执行链由 container 静态构造，不消费本函数的排序结果；
+    若未来接入"健康检查驱动的动态路由"，由 container 调用本函数重排 provider 链。
+    """
     reachable_providers = {health.provider for health in report.providers if health.reachable}
 
     if preferred and preferred in reachable_providers:
