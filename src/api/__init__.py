@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import typing
 
-from api.middleware import ErrorEnvelope, RequestContext, map_exception
+from api.middleware import ErrorEnvelope, map_exception
 from api.schemas import (
     AgentRequestBody,
     AgentResponseBody,
@@ -51,7 +51,6 @@ __all__ = [
     "IngestRequestBody",
     "IngestResponseBody",
     "MessageResponseBody",
-    "RequestContext",
     "RetrievedDocumentView",
     "create_app",
     "map_exception",
