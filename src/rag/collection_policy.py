@@ -13,7 +13,8 @@ import typing
 
 from pydantic import BaseModel
 
-from base.exceptions import ConfigurationError, IngestError
+from base.exceptions import CollectionCompatibilityError, ConfigurationError
+
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from model.embedding import EmbeddingModel
@@ -82,22 +83,14 @@ class CollectionPolicy(BaseModel):
         if len(cleaned) <= self.max_name_length:
             return cleaned
 
-        # 安全截断：保留首部前缀和尾部的唯一哈希标识
-        half_len = self.max_name_length // 2
-        prefix = cleaned[:half_len]
-        suffix = cleaned[-(self.max_name_length - half_len):]
-        return f"{prefix}_{suffix}"
+        # 安全截断：前缀 + "_" + 唯一后缀，总长度不超过 max_name_length
+        prefix_len = self.max_name_length // 2
+        suffix_len = self.max_name_length - prefix_len - 1  # 减 1 是下划线
+        return f"{cleaned[:prefix_len]}_{cleaned[-suffix_len:]}"
 
     @staticmethod
     def _slug(text: str) -> str:
         return _SAFE_NAME.sub("_", text).strip("_").lower() or "unknown"
-
-
-class CollectionCompatibilityError(IngestError):
-    """当现有集合与当前 Embedder 不兼容时抛出。"""
-
-    status_code = 409
-    error_code = "collection_incompatible"
 
 
 def _extract_normalize(embedder: typing.Any) -> bool:
@@ -118,6 +111,11 @@ def _extract_normalize(embedder: typing.Any) -> bool:
 def fingerprint_embedder(embedder: EmbeddingModel, model_name: str) -> EmbeddingFingerprint:
     """从 Embedder 实例创建指纹。"""
     dimension = getattr(embedder, "dimension", 0)
+    if not dimension:
+        # 本地 Embedding 懒加载，首次 encode 后才有 dimension；
+        # 用一次 warmup 查询触发加载，避免 /readyz 在懒加载前读到 0。
+        embedder.embed_query("warmup")
+        dimension = getattr(embedder, "dimension", 0)
     if not dimension:
         raise ConfigurationError(
             "Embedder 缺乏可测量的维度；在打开集合前必须先加载模型。",
