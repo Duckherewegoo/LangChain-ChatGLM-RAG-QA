@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 import threading
 import typing
@@ -20,6 +19,7 @@ import typing
 from pydantic import BaseModel, Field
 
 from base.exceptions import AgentExecutionError, PermissionDeniedError, ValidationError
+from base.observability import get_logger
 from rag.tool_sources import (
     LocalToolSource,
     ToolSource,
@@ -31,7 +31,7 @@ if typing.TYPE_CHECKING:  # 仅用于类型检查
     from rag.service import RAGService
     from settings import GuardrailsSettings
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _INJECTION_PATTERNS = [
     re.compile(r"ignore\s+(all\s+)?(previous|above)\s+instructions?", re.IGNORECASE),
@@ -96,6 +96,7 @@ class ToolRegistry:
         self._sources: list[ToolSource] = list(sources or [])
         self._allowed = _normalize_allow_list(allowed_tools)
         self._spec_cache: dict[str, ToolSpec] | None = None
+        self._source_map: dict[str, ToolSource] | None = None
         self._cache_lock = threading.Lock()
 
     def add_source(self, source: ToolSource) -> None:
@@ -105,6 +106,7 @@ class ToolRegistry:
         with self._cache_lock:
             self._sources.append(source)
             self._spec_cache = None
+            self._source_map = None
 
     def set_allowed(self, allowed_tools: typing.Iterable[str]) -> None:
         """运行时替换白名单。[] 表示什么都不允许。"""
@@ -112,15 +114,19 @@ class ToolRegistry:
             self._allowed = _normalize_allow_list(allowed_tools)
 
     def _resolve_specs(self) -> dict[str, ToolSpec]:
-        """返回 {name: spec}，首次来源优先去重。"""
+        """返回 {name: spec}，首次来源优先去重；同时缓存 {name: source}。"""
         with self._cache_lock:
-            if self._spec_cache is not None:
+            if self._spec_cache is not None and self._source_map is not None:
                 return self._spec_cache
             specs: dict[str, ToolSpec] = {}
+            sources: dict[str, ToolSource] = {}
             for source in self._sources:
                 for spec in source.list_specs():
-                    specs.setdefault(spec.name, spec)
+                    if spec.name not in specs:
+                        specs[spec.name] = spec
+                        sources[spec.name] = source
             self._spec_cache = specs
+            self._source_map = sources
             return specs
 
     def names(self) -> list[str]:
@@ -165,12 +171,14 @@ class ToolRegistry:
                 f"工具 {name!r} 不被当前智能体配置允许。",
                 details={"allowed_tools": self.allowed_names()},
             )
-        spec = specs[name]
-        return self._wrap_spec(spec)
+        # _resolve_specs() 在锁内保证 _spec_cache 与 _source_map 同时构建，
+        # 缓存命中条件也要求 _source_map 非 None，因此这里必非空；
+        # assert 仅用于向类型检查器收窄类型。
+        assert self._source_map is not None
+        return self._wrap_spec(specs[name], self._source_map[name])
 
-    def _wrap_spec(self, spec: ToolSpec) -> ToolHandler:
+    def _wrap_spec(self, spec: ToolSpec, source: ToolSource) -> ToolHandler:
         """将 ToolSpec 适配为普通可调用对象。"""
-        source = spec.source
         if isinstance(source, LocalToolSource):
             return source.get_handler(spec.name)
 
@@ -208,8 +216,17 @@ def create_rag_tool_registry(service: "RAGService") -> ToolRegistry:
         safe_arguments.setdefault("owner_id", context.owner_id)
         if context.allowed_sources:
             requested = safe_arguments.get("allowed_sources") or []
-            merged = list(dict.fromkeys([*context.allowed_sources, *requested]))
-            safe_arguments["allowed_sources"] = merged
+            if requested:
+                # 交集：调用方白名单是上限，模型只能缩小，不能扩大。
+                merged = [s for s in requested if s in context.allowed_sources]
+                if not merged:
+                    raise PermissionDeniedError(
+                        "请求的来源不在允许范围内。",
+                        details={"allowed_sources": list(context.allowed_sources)},
+                    )
+                safe_arguments["allowed_sources"] = merged
+            else:
+                safe_arguments["allowed_sources"] = list(context.allowed_sources)
 
         request = AnswerRequest(**safe_arguments)
         result = service.retrieve_only(request)
@@ -234,7 +251,8 @@ def create_rag_tool_registry(service: "RAGService") -> ToolRegistry:
                 owner_id=context.owner_id,
             )
         )
-        return {"sources": result.distinct_sources(), "count": len(result.documents)}
+        sources = list(dict.fromkeys(doc.source for doc in result.documents if doc.source))
+        return {"sources": sources, "count": len(result.documents)}
 
     def summarize_citations(
         arguments: dict[str, typing.Any], context: ToolContext
