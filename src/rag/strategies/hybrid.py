@@ -16,6 +16,10 @@ from .types import Candidate, QueryRewrite
 
 logger = get_logger(__name__)
 
+# RetrievalContext.candidates 里 document.content 的截断长度（字符数）。
+# 该字段仅用于审计 / 调试；最终对外 documents 仍使用完整原文。
+_CANDIDATE_CONTENT_LIMIT = 500
+
 
 class RetrievalContext(RetrievedContext):
     """带策略审计信息的检索上下文。"""
@@ -80,9 +84,7 @@ class HybridRetrieval:
             documents=[entry.document for entry in fused],
             search_type="hybrid" if len(strategy_labels) > 1 else strategy_labels[0],
             rewrite=rewrite,
-            # candidates 是全量原始候选（含 content 全文），仅用于审计/调试。
-            # 对外序列化时应排除该字段（体积可能为 documents 的 10 倍以上）。
-            candidates=all_candidates,
+            candidates=_snippet_candidates(all_candidates),
             strategy_notes=per_query,
         )
         logger.info(
@@ -93,3 +95,32 @@ class HybridRetrieval:
             len(fused),
         )
         return context
+
+
+def _snippet_candidates(
+    candidates: list[Candidate], *, max_chars: int = _CANDIDATE_CONTENT_LIMIT
+) -> list[Candidate]:
+    """复制候选，把 document.content 截断到 max_chars。
+
+    仅作用于审计字段 RetrievalContext.candidates；由 fuser 产出的
+    documents 使用完整原文。截断后的 Candidate 是新的 frozen 实例，
+    原 Candidate 与其 document 不受影响。
+    """
+    truncated: list[Candidate] = []
+    for candidate in candidates:
+        content = candidate.document.content or ""
+        if len(content) <= max_chars:
+            truncated.append(candidate)
+            continue
+        document = candidate.document.model_copy(
+            update={"content": content[:max_chars] + "…"}
+        )
+        truncated.append(
+            Candidate(
+                document=document,
+                score=candidate.score,
+                source=candidate.source,
+                rank=candidate.rank,
+            )
+        )
+    return truncated

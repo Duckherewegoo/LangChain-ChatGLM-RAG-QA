@@ -32,6 +32,9 @@ class ReciprocalRankFusion(ResultFuser):
         scores: dict[str, float] = {}
         for candidate in candidates:
             key = candidate.document.chunk_id
+            # 跨 source 分数虽不可直接比较，但"保留哪个 document 版本"
+            # （如是否含 rerank_score）需要一个确定性规则。
+            # 当前规则：score 高者优先；可能保留 vector 版本。
             if key not in grouped or candidate.score > grouped[key].score:
                 grouped[key] = candidate
             scores[key] = scores.get(key, 0.0) + 1.0 / (self._k + candidate.rank + 1)
@@ -54,6 +57,10 @@ class ScoreWeightedFuser(ResultFuser):
         scores: dict[str, float] = {}
         for candidate in candidates:
             key = candidate.document.chunk_id
+            # 未配置的 source 默认权重 1.0：可能与已配的 vector/keyword
+            # 相比更高（如配 vector=0.7 / keyword=0.3，未配的 graph=1.0）。
+            # 这是有意的"未配置=全权重"策略；如需严格校验，应在
+            # create_fuser 里检查 weights 是否覆盖所有注册 source。
             weight = float(self._weights.get(candidate.source, 1.0))
             if key not in grouped or candidate.score > grouped[key].score:
                 grouped[key] = candidate
@@ -64,7 +71,12 @@ class ScoreWeightedFuser(ResultFuser):
 
 
 class DeduplicatingFuser(ResultFuser):
-    """只做去重保序。"""
+    """只做去重保序，不计算分数。
+
+    顺序 = candidates 的插入顺序。HybridRetrieval 按 "query 循环 ×
+    strategy 循环" 展开候选，因此排序实际由 strategies 的配置顺序决定——
+    排在前面的通道优先。适合"信任某一路"的场景。
+    """
     name = "dedupe"
 
     def fuse(self, candidates: list[Candidate], *, top_k: int) -> list[Candidate]:
