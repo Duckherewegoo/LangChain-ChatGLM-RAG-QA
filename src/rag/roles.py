@@ -269,11 +269,7 @@ class ReviewerRole(Role):
     )
 
     def build_prompt(self, blackboard: Blackboard) -> str:
-        """构造审核提示词。
-
-        注意：当前 orchestrator 直接调用 AnswerReviewer，本方法未被调用；
-        保留用于将来接入 LLM 化审核。
-        """
+        """构造审核提示词，由 AnswerReviewer._review_with_llm 调用。"""
         evidence = blackboard.evidence or []
         # 移除了硬编码的 [:400] 截断，交由上层控制
         evidence_text = "\n".join(

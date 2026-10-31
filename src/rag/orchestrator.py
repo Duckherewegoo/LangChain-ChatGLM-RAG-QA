@@ -325,11 +325,11 @@ class AgentOrchestrator:
             trail.record_now(
                 event_type=AgentEventType.REVIEW_ISSUE,
                 node="reviewer",
-                status=issue.get("severity", "warning"),
                 message=issue.get("message", ""),
+                status=issue.severity,
                 data={
-                    "code": issue.get("code"),
-                    "suggestion": issue.get("suggestion"),
+                    "code": issue.code,
+                    "suggestion": issue.suggestion,
                 },
             )
         return report

@@ -1,6 +1,6 @@
 """答案发布前审核（Reviewer）。
 
-审核发生在 harness 生成答案之后、响应返回用户之前，是整个流水线里
+审核发生在答案生成之后、响应返回用户之前，是流水线里
 "事实性兜底"的最后一道闸。它回答四个问题：
 
 1. 答案里的断言是否都有证据支撑？（事实性）
@@ -9,15 +9,23 @@
 4. 术语、数值是否与证据一致？（口径一致性）
 
 设计要点：
-1. 审核结果是结构化的 ReviewReport，不是一段自由文本。这让 harness 能
-   自动决定"重试"还是"拒答"，而不是靠正则去抠模型的评语。
-2. 审核走双层降级：先尝试用模型做语义审核；模型不可用或输出不合法时
-   退化为基于规则的确定性审核。
-3. 报告里带 retryable 与 severity 两个维度。harness 据此决定：
+1. 审核结果是结构化的 ReviewReport（issues 为 ReviewIssue 列表），
+   不是自由文本。编排器据此决定"重试"还是"拒答"，不靠正则抠评语。
+2. 三层降级：LLM 审核 → 规则审核 → fail-open（放行 + warning）。
+   fail-open 是刻意的可用性取舍：审核器本身不应成为单点故障。
+   如需 fail-closed，请在编排层检查 review_status 并自行处理。
+3. 报告里带 retryable 与 severity 两个维度。编排器据此决定：
    blocking 且 retryable -> 重做；blocking 且不可重试 -> 安全拒答；
    warning -> 放行并附提示。
-4. 审核器的提示词与 ReviewerRole 的契约是同一份，角色负责"声明"，
-   审核器负责"执行"。
+4. 审核提示词由 ReviewerRole.build_prompt 提供；角色声明契约，
+   审核器负责执行。
+
+已知限制：
+- 越权披露检查依赖 evidence 的权限元数据（tenant_id / owner_id），
+  当前 review() 接口未接收这些字段，规则审核路径下该检查不可执行。
+- 审核模型调用本身不写入 AgentAuditTrail；只有 REVIEW_COMPLETED 事件会
+  带 report.model / strategy。完整审计需在编排层传入 trail 或使用
+  on_issue 回调。
 """
 
 from __future__ import annotations
@@ -36,10 +44,13 @@ logger = get_logger(__name__)
 
 _SEVERITIES = {"blocking", "warning", "info"}
 _CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+_REFUSAL_PATTERN = re.compile(
+    r"无法确认|无法回答|无法找到|没有可访问|没有可用于|暂无|未找到"
+)
 
 
 class ReviewIssue(BaseModel):
-    """一条审核问题。不可变，便于审计与测试比对。"""
+    """一条审核问题。frozen，便于审计与测试比对。"""
 
     model_config = {"frozen": True}
 
@@ -60,21 +71,21 @@ class ReviewIssue(BaseModel):
 
 
 class ReviewReport(BaseModel):
-    """一次审核的结构化结论。"""
+    """一次审核的结构化结论。issues 直接持有 ReviewIssue 对象。"""
 
     approved: bool
-    issues: list[dict[str, typing.Any]] = Field(default_factory=list)
+    issues: list[ReviewIssue] = Field(default_factory=list)
     summary: str = ""
     model: str | None = None
     strategy: str = "rule"
 
     @property
-    def blocking(self) -> list[dict[str, typing.Any]]:
-        return [issue for issue in self.issues if issue.get("severity") == "blocking"]
+    def blocking(self) -> list[ReviewIssue]:
+        return [issue for issue in self.issues if issue.severity == "blocking"]
 
     @property
-    def warnings(self) -> list[dict[str, typing.Any]]:
-        return [issue for issue in self.issues if issue.get("severity") == "warning"]
+    def warnings(self) -> list[ReviewIssue]:
+        return [issue for issue in self.issues if issue.severity == "warning"]
 
     def retryable(self) -> bool:
         """是否有理由让 harness 重做一次推理。
@@ -83,14 +94,14 @@ class ReviewReport(BaseModel):
         这是为了避免空答案之类不可恢复的问题让 harness 无谓重试烧钱。
         """
         return any(
-            issue.get("severity") == "blocking" and issue.get("retryable", True)
+            issue.severity == "blocking" and issue.retryable
             for issue in self.issues
         )
 
     def to_dict(self) -> dict[str, typing.Any]:
         return {
             "approved": self.approved,
-            "issues": list(self.issues),
+            "issues": [issue.to_dict() for issue in self.issues],
             "summary": self.summary,
             "model": self.model,
             "strategy": self.strategy,
@@ -99,7 +110,12 @@ class ReviewReport(BaseModel):
 
 
 class AnswerReviewer:
-    """对答案做发布前质检。"""
+    """对答案做发布前质检。
+
+    降级链：LLM 审核 → 规则审核 → fail-open（放行 + warning）。
+    最后一层是刻意的可用性取舍：审核器内部异常时放行并打 warning，
+    而非让全站拒答。
+    """
 
     def __init__(
         self,
@@ -123,18 +139,25 @@ class AnswerReviewer:
         answer: str,
         evidence: typing.Sequence[dict[str, typing.Any]],
     ) -> ReviewReport:
-        """审核答案，优先用 LLM，失败则退化为规则审核。"""
-        normalized = (answer or "").strip()
-        evidence_list = list(evidence)
+        """审核答案，优先用 LLM；LLM 失败或输出无法解析时降级为规则审核。"""
+        stripped_answer = (answer or "").strip()
+        evidence_items = list(evidence)
 
-        if self._model is not None and normalized:
+        if self._model is not None and stripped_answer:
             try:
-                return self._review_with_llm(question, normalized, evidence_list)
+                report = self._review_with_llm(
+                    question, stripped_answer, evidence_items
+                )
+                if report is not None:
+                    return report
+                logger.warning("LLM 审核输出无法解析，降级为规则审核。")
             except Exception as exc:
                 logger.warning(f"LLM 审核失败，降级为规则审核 | error={exc!s}")
 
         try:
-            return self._review_with_rules(question, normalized, evidence_list)
+            return self._review_with_rules(
+                question, stripped_answer, evidence_items
+            )
         except Exception as exc:
             logger.exception(f"规则审核意外失败 | error={exc!s}")
             return ReviewReport(
@@ -146,7 +169,7 @@ class AnswerReviewer:
                         message=f"审核器内部异常: {exc}",
                         suggestion="本次审核已跳过，请人工复核。",
                         retryable=False,
-                    ).to_dict()
+                    )
                 ],
                 summary="审核器内部异常，已放行并标记警告。",
                 strategy="rule",
@@ -156,17 +179,21 @@ class AnswerReviewer:
         self,
         question: str,
         answer: str,
-        evidence: list[dict[str, typing.Any]],
-    ) -> ReviewReport:
+        evidence_items: list[dict[str, typing.Any]],
+    ) -> ReviewReport | None:
+        """调用模型审核；模型输出无法解析为 JSON 时返回 None。"""
         # Pyright 无法跨方法追踪 self._model 的窄化，显式断言
         assert self._model is not None, "_review_with_llm 需要已配置的模型"
-        prompt = self._role.build_prompt(_blackboard_for(question, answer, evidence))
+        prompt = self._role.build_prompt(
+            _blackboard_for(question, answer, evidence_items)
+        )
         response = self._model.invoke(
             ChatRequest(messages=[{"role": "user", "content": prompt}], tools=[])
         )
         report = _parse_review_response(response)
+        if report is None:
+            return None
         report.model = response.model or getattr(self._model, "name", None)
-        report.strategy = "llm"
         self._emit_issues(report)
         return report
 
@@ -174,7 +201,7 @@ class AnswerReviewer:
         self,
         question: str,
         answer: str,
-        evidence: list[dict[str, typing.Any]],
+        evidence_items: list[dict[str, typing.Any]],
     ) -> ReviewReport:
         """不依赖 LLM 的确定性审核，覆盖三条硬红线。
 
@@ -194,20 +221,24 @@ class AnswerReviewer:
                 )
             )
 
-        if not evidence:
-            issues.append(
-                ReviewIssue(
-                    code="no_evidence",
-                    severity="blocking",
-                    message="没有可用证据却产生了答案。",
-                    suggestion="先执行检索，或返回无法确认声明。",
-                    retryable=True,
+        if not evidence_items:
+            # 拒答文案本身不需要证据支撑；只有"非拒答但缺证据"才判 blocking。
+            if not _is_refusal(answer):
+                issues.append(
+                    ReviewIssue(
+                        code="no_evidence",
+                        severity="blocking",
+                        message="没有可用证据却产生了答案。",
+                        suggestion="先执行检索，或返回明确的无法确认声明。",
+                        retryable=False,  # 重试推理不会凭空产生证据
+                    )
                 )
-            )
         else:
-            used = {int(ref) for ref in _CITATION_PATTERN.findall(answer)}
-            valid_range = range(1, len(evidence) + 1)
-            out_of_range = sorted(ref for ref in used if ref not in valid_range)
+            cited_indices = {int(ref) for ref in _CITATION_PATTERN.findall(answer)}
+            valid_indices = range(1, len(evidence_items) + 1)
+            out_of_range = sorted(
+                ref for ref in cited_indices if ref not in valid_indices
+            )
             if out_of_range:
                 issues.append(
                     ReviewIssue(
@@ -215,14 +246,14 @@ class AnswerReviewer:
                         severity="blocking",
                         message=(
                             f"答案引用了不存在的编号 {out_of_range}，"
-                            f"有效范围是 1..{len(evidence)}。"
+                            f"有效范围是 1..{len(evidence_items)}。"
                         ),
                         suggestion="修正引用编号，使其与证据序号一致。",
                         retryable=True,
                     )
                 )
 
-            if not used:
+            if not cited_indices:
                 issues.append(
                     ReviewIssue(
                         code="no_inline_citation",
@@ -236,7 +267,7 @@ class AnswerReviewer:
         approved = not any(issue.severity == "blocking" for issue in issues)
         report = ReviewReport(
             approved=approved,
-            issues=[issue.to_dict() for issue in issues],
+            issues=issues,
             summary="规则审核通过。" if approved else "规则审核发现阻断性问题。",
             strategy="rule",
         )
@@ -246,17 +277,9 @@ class AnswerReviewer:
     def _emit_issues(self, report: ReviewReport) -> None:
         if not self._on_issue:
             return
-        for raw in report.issues:
+        for issue in report.issues:
             try:
-                self._on_issue(
-                    ReviewIssue(
-                        code=raw.get("code", "unknown"),
-                        severity=raw.get("severity", "warning"),
-                        message=raw.get("message", ""),
-                        suggestion=raw.get("suggestion", ""),
-                        retryable=raw.get("retryable", True),
-                    )
-                )
+                self._on_issue(issue)
             except Exception:
                 logger.exception("审核问题监听器回调失败。")
 
@@ -264,40 +287,27 @@ class AnswerReviewer:
 def _blackboard_for(
     question: str,
     answer: str,
-    evidence: list[dict[str, typing.Any]],
+    evidence_items: list[dict[str, typing.Any]],
 ) -> Blackboard:
     """为角色提示词构造最小黑板。"""
     return Blackboard(
         request_id="review",
         original_question=question,
         answer_draft=answer,
-        evidence=evidence,
+        evidence=evidence_items,
     )
 
 
-def _parse_review_response(response: ChatResponse) -> ReviewReport:
-    """把模型输出解析成 ReviewReport；解析失败即视为审核未通过。"""
+def _parse_review_response(response: ChatResponse) -> ReviewReport | None:
+    """把模型输出解析成 ReviewReport；无法解析时返回 None。"""
     text = (getattr(response, "content", "") or "").strip()
     data = _extract_json_object(text)
 
     if not isinstance(data, dict):
-        return ReviewReport(
-            approved=False,
-            issues=[
-                {
-                    "code": "review_output_unparseable",
-                    "severity": "blocking",
-                    "message": "审核模型未返回可解析的 JSON。",
-                    "suggestion": "重试一次；持续失败时降级为规则审核。",
-                    "retryable": True,
-                }
-            ],
-            summary="审核输出无法解析。",
-            strategy="llm",
-        )
+        return None
 
     raw_issues = data.get("issues") or []
-    issues: list[dict[str, typing.Any]] = []
+    issues: list[ReviewIssue] = []
     for item in raw_issues:
         if not isinstance(item, dict):
             continue
@@ -305,17 +315,17 @@ def _parse_review_response(response: ChatResponse) -> ReviewReport:
         if severity not in _SEVERITIES:
             severity = "warning"
         issues.append(
-            {
-                "code": str(item.get("code", "generic")),
-                "severity": severity,
-                "message": str(item.get("message", "")),
-                "suggestion": str(item.get("suggestion", "")),
-                "retryable": bool(item.get("retryable", True)),
-            }
+            ReviewIssue(
+                code=str(item.get("code", "generic")),
+                severity=severity,
+                message=str(item.get("message", "")),
+                suggestion=str(item.get("suggestion", "")),
+                retryable=bool(item.get("retryable", True)),
+            )
         )
 
     approved = bool(data.get("approved", False)) and not any(
-        item.get("severity") == "blocking" for item in issues
+        issue.severity == "blocking" for issue in issues
     )
     return ReviewReport(
         approved=approved,
@@ -323,6 +333,11 @@ def _parse_review_response(response: ChatResponse) -> ReviewReport:
         summary=str(data.get("summary", "")),
         strategy="llm",
     )
+
+
+def _is_refusal(answer: str) -> bool:
+    """判断答案是否为明确的拒答文案（用于 no_evidence 规则豁免）。"""
+    return bool(_REFUSAL_PATTERN.search(answer))
 
 
 def _extract_json_object(text: str) -> typing.Any:
