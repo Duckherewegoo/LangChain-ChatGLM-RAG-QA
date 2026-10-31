@@ -1,7 +1,9 @@
 """应用配置
 
 从环境变量、可选的 .env 文件和可选的 YAML 文档加载配置。
-环境变量的值优先级最高，因此密钥管理和部署自动化无需修改已提交的配置文件。
+优先级：overrides > 环境变量 > YAML > 默认值。
+环境变量中 RAG_ 前缀风格最后合并，因此优先于 MODEL_CHAT_ 等扁平风格。
+因此密钥管理和部署自动化无需修改已提交的配置文件。
 """
 
 from __future__ import annotations
@@ -14,7 +16,11 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, ValidationError
 
+from exceptions import ConfigurationError
 from model.routing_types import ModelEmbeddingSettings, ModelRouterSettings
+from observability import get_logger
+
+logger = get_logger(__name__)
 
 
 class ModelChatSettings(BaseModel):
@@ -27,6 +33,7 @@ class ModelChatSettings(BaseModel):
     temperature: float = Field(default=0.2, ge=0.0)
     max_tokens: int | None = Field(default=None, gt=0)
     timeout_seconds: float = Field(default=30.0, gt=0)
+    # 保留字段：默认保守重试策略，未来接入重试逻辑时使用
     max_retries: int = Field(default=2, ge=0)
 
     @property
@@ -44,6 +51,7 @@ class VectorStoreSettings(BaseModel):
     max_collection_name_length: int = Field(default=63, ge=1)
     persist_directory: str = Field(default="./data/index")
     hnsw_space: str = Field(default="cosine")
+    # 保留字段：container 实际以 store.dimension() 为准，此处暂不读取
     dimension: int = Field(default=0, ge=0, description="0 表示自动探测")
 
 
@@ -109,6 +117,7 @@ class ReviewSettings(BaseModel):
 class AgentSettings(BaseModel):
     """Agent 循环与角色配置。"""
 
+    # 保留字段：默认保守预算，见 README 默认配置说明
     max_iterations: int = Field(default=8, ge=1)
     max_tool_calls: int = Field(default=16, ge=1)
     timeout_seconds: float = Field(default=60.0, ge=0)
@@ -153,6 +162,10 @@ class AppSettings(BaseModel):
     """
 
     app_env: str = Field(default="dev", description="dev | staging | prod")
+    app_name: str = Field(
+        default="enterprise-rag",
+        description="应用名，可用 YAML app.name 或 APP_NAME 覆盖",
+    )
     log_level: str = Field(default="INFO", description="DEBUG | INFO | WARNING | ERROR")
 
     model_chat: ModelChatSettings = Field(default_factory=lambda: ModelChatSettings())
@@ -171,15 +184,16 @@ class AppSettings(BaseModel):
     api: ApiSettings = Field(default_factory=lambda: ApiSettings())
 
 
-class ConfigurationError(RuntimeError):
-    """配置装配或校验失败时抛出。"""
-
-
 def load_settings(
     config_path: str | os.PathLike[str] | None = None,
     *,
     overrides: typing.Mapping[str, typing.Any] | None = None,
 ) -> AppSettings:
+    """加载并合并配置。
+
+    优先级：overrides > 环境变量 > YAML > 默认值。
+    环境变量中 RAG_ 前缀风格最后合并，因此优先于 MODEL_CHAT_ 等扁平风格。
+    """
     sources: list[dict[str, typing.Any]] = []
 
     yaml_path = _resolve_yaml_path(config_path)
@@ -207,6 +221,7 @@ def load_settings(
     except ValidationError as exc:
         raise ConfigurationError(f"配置校验失败: {exc}") from exc
 
+
 def _resolve_yaml_path(config_path: str | os.PathLike[str] | None) -> Path | None:
     """按显式参数 → 环境变量 → 项目默认路径 → CWD 的顺序解析 YAML 路径。
 
@@ -225,7 +240,8 @@ def _resolve_yaml_path(config_path: str | os.PathLike[str] | None) -> Path | Non
             return candidate
         raise ConfigurationError(f"RAG_CONFIG 指定的文件不存在: {candidate}")
 
-    project_root = Path(__file__).resolve().parent.parent.parent
+    # settings.py 位于 <root>/settings/，parents[1] 即项目根
+    project_root = Path(__file__).resolve().parents[1]
     candidate = project_root / "config" / "settings.yaml"
     if candidate.exists():
         return candidate
@@ -257,31 +273,45 @@ def _load_yaml_safely(path: Path) -> dict[str, typing.Any]:
 def _normalize_yaml_config(raw: dict[str, typing.Any]) -> dict[str, typing.Any]:
     """将 YAML 中的习惯写法（app, model.chat）归一化为 AppSettings 的扁平字段。"""
     result = dict(raw)
-    
+
     # 1. 适配 app -> app_name, app_env, api
     app_cfg = result.pop("app", {})
-    if isinstance(app_cfg, dict):
-        if "name" in app_cfg:
-            result.setdefault("app_name", app_cfg["name"])
-        if "env" in app_cfg:
-            result.setdefault("app_env", app_cfg["env"])
-        api = result.setdefault("api", {})
-        if "host" in app_cfg:
-            api.setdefault("host", app_cfg["host"])
-        if "port" in app_cfg:
-            api.setdefault("port", app_cfg["port"])
+    if app_cfg is None:
+        # YAML 里写了 `app:` 或 `app: null`，视作未配置
+        app_cfg = {}
+    elif not isinstance(app_cfg, dict):
+        logger.warning("YAML 字段 app 不是映射，已忽略 | value=%r", app_cfg)
+        app_cfg = {}
+    if "name" in app_cfg:
+        result.setdefault("app_name", app_cfg["name"])
+    if "env" in app_cfg:
+        result.setdefault("app_env", app_cfg["env"])
+    api = result.setdefault("api", {})
+    if "host" in app_cfg:
+        api.setdefault("host", app_cfg["host"])
+    if "port" in app_cfg:
+        api.setdefault("port", app_cfg["port"])
 
     # 2. 适配 model.chat / model.embedding
     model_cfg = result.pop("model", {})
-    if isinstance(model_cfg, dict):
-        if "chat" in model_cfg:
-            result.setdefault("model_chat", model_cfg["chat"])
-        if "embedding" in model_cfg:
-            result.setdefault("model_embedding", model_cfg["embedding"])
+    if model_cfg is None:
+        model_cfg = {}
+    elif not isinstance(model_cfg, dict):
+        logger.warning("YAML 字段 model 不是映射，已忽略 | value=%r", model_cfg)
+        model_cfg = {}
+    if "chat" in model_cfg:
+        result.setdefault("model_chat", model_cfg["chat"])
+    if "embedding" in model_cfg:
+        result.setdefault("model_embedding", model_cfg["embedding"])
 
     # 3. 适配 security -> guardrails
     security_cfg = result.pop("security", {})
-    if isinstance(security_cfg, dict):
+    if security_cfg is None:
+        security_cfg = {}
+    elif not isinstance(security_cfg, dict):
+        logger.warning("YAML 字段 security 不是映射，已忽略 | value=%r", security_cfg)
+        security_cfg = {}
+    if security_cfg:
         result.setdefault("guardrails", security_cfg)
 
     return result
@@ -290,7 +320,7 @@ def _normalize_yaml_config(raw: dict[str, typing.Any]) -> dict[str, typing.Any]:
 def _normalize_env_config(env: typing.Mapping[str, str]) -> dict[str, typing.Any]:
     """将 .env 中的扁平键名映射到 AppSettings 的嵌套字段。"""
     result: dict[str, typing.Any] = {}
-    
+
     def _set_nested(keys: list[str], value: typing.Any) -> None:
         cursor = result
         for k in keys[:-1]:
@@ -299,11 +329,16 @@ def _normalize_env_config(env: typing.Mapping[str, str]) -> dict[str, typing.Any
 
     for key, val in env.items():
         # 1. 处理通用前缀
-        if key == "APP_ENV": _set_nested(["app_env"], val)
-        elif key == "APP_NAME": _set_nested(["app_name"], val)
-        elif key == "APP_LOG_LEVEL": _set_nested(["log_level"], val)
-        elif key == "APP_HOST": _set_nested(["api", "host"], val)
-        elif key == "APP_PORT": _set_nested(["api", "port"], _coerce_env_value(val))
+        if key == "APP_ENV":
+            _set_nested(["app_env"], val)
+        elif key == "APP_NAME":
+            _set_nested(["app_name"], val)
+        elif key == "APP_LOG_LEVEL":
+            _set_nested(["log_level"], val)
+        elif key == "APP_HOST":
+            _set_nested(["api", "host"], val)
+        elif key == "APP_PORT":
+            _set_nested(["api", "port"], _coerce_env_value(val))
 
         # 2. 处理 MODEL_CHAT_
         elif key.startswith("MODEL_CHAT_"):
@@ -323,6 +358,10 @@ def _normalize_env_config(env: typing.Mapping[str, str]) -> dict[str, typing.Any
                 _set_nested(["retrieval", "rerank", field[7:]], _coerce_env_value(val))
             elif field.startswith("vector_store_"):
                 _set_nested(["retrieval", "vector_store", field[13:]], _coerce_env_value(val))
+            elif field.startswith("fusion_"):
+                _set_nested(["retrieval", "fusion", field[7:]], _coerce_env_value(val))
+            elif field.startswith("keyword_"):
+                _set_nested(["retrieval", "keyword", field[8:]], _coerce_env_value(val))
             else:
                 _set_nested(["retrieval", field], _coerce_env_value(val))
 
@@ -342,6 +381,7 @@ def _normalize_env_config(env: typing.Mapping[str, str]) -> dict[str, typing.Any
 
     return result
 
+
 def _apply_environment(env: typing.Mapping[str, str]) -> dict[str, typing.Any]:
     """将 RAG_ 前缀的扁平环境变量翻译成 AppSettings 期望的嵌套结构。
 
@@ -355,7 +395,7 @@ def _apply_environment(env: typing.Mapping[str, str]) -> dict[str, typing.Any]:
         if not key.startswith(prefix):
             continue
         parts = key[len(prefix):].lower().split("__")
-        if not parts or not parts[0]:
+        if not parts[0]:
             continue
         cursor: dict[str, typing.Any] = result
         for segment in parts[:-1]:

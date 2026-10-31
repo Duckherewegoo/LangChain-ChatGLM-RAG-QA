@@ -7,7 +7,6 @@ from settings.settings import (
     AgentSettings,
     ApiSettings,
     AppSettings,
-    ConfigurationError,
     FusionSettings,
     GuardrailsSettings,
     IngestSettings,
@@ -22,6 +21,8 @@ from settings.settings import (
     VectorStoreSettings,
     load_settings,
 )
+
+from exceptions import ConfigurationError
 
 __all__ = [
     "AgentSettings",
