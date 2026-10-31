@@ -198,18 +198,33 @@ class Container:
             self._strategies = strategies
         return self._strategies
 
-    def _build_keyword_strategy(self) -> RetrievalStrategy | None:
-        from rag.strategies import InMemoryBM25Index, KeywordRetrievalStrategy
+    def _ensure_keyword_index(self) -> "InMemoryBM25Index | None":
+        """确保关键词索引已构建，返回共享实例；未启用时返回 None。
 
-        cfg = self._settings.retrieval.keyword
-        if not cfg.enabled:
+        单一构造点：_build_keyword_strategy（查询侧）与 ingest_pipeline
+        （写入/删除侧）都必须经此获取索引，否则会出现"写入 A、查询 B"
+        的两份实例，P0-5 表现为"修了但没生效"。
+        """
+        if not self._settings.retrieval.keyword.enabled:
             return None
-        # 已知问题（P0-1）：此索引构造后从未被写入——IngestPipeline 只写
-        # vector_store。keyword 分支对任何 query 都返回空，hybrid 实际退化
-        # 为纯 vector。完整修复需让 IngestPipeline 写入此索引，或启动时
-        # 从 vector_store 回填原文（BM25 需要原文，回填成本较高）。
-        self._keyword_index = InMemoryBM25Index()
-        return KeywordRetrievalStrategy(self._keyword_index)
+        if self._keyword_index is None:
+            from rag.strategies import InMemoryBM25Index
+
+            self._keyword_index = InMemoryBM25Index()
+            # 说明（P0-5 已知边界）：内存索引不持久化，进程重启后为空；
+            # 已有向量数据不会自动回填关键词索引。混合检索在重启后到下一次
+            # ingest 之前，keyword 分支仍会返回空。长期方案是启动时从
+            # vector_store 全量回填（BM25 需原文），或引入后台对账任务。
+            logger.info("关键词索引已初始化（内存态，不持久化）")
+        return self._keyword_index
+
+    def _build_keyword_strategy(self) -> RetrievalStrategy | None:
+        index = self._ensure_keyword_index()
+        if index is None:
+            return None
+        from rag.strategies import KeywordRetrievalStrategy
+
+        return KeywordRetrievalStrategy(index)
 
     def hybrid_retrieval(self) -> HybridRetrieval:
         if self._hybrid is None:
@@ -306,7 +321,12 @@ class Container:
                 min_characters=self._settings.ingest.min_characters,
             )
             self._ingest_pipeline = IngestPipeline(
-                loader=loader, chunker=chunker, vector_store=self.vector_store()
+                loader=loader,
+                chunker=chunker,
+                vector_store=self.vector_store(),
+                # 注入共享关键词索引：ingest 写入 / remove 删除会同步维护。
+                # 未启用 keyword 检索时为 None，pipeline 内部会跳过同步。
+                keyword_index=self._ensure_keyword_index(),
             )
         return self._ingest_pipeline
 
