@@ -12,7 +12,11 @@ import time
 import typing
 import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
+
+from observability import get_logger
+
+logger = get_logger(__name__)
 
 
 class AgentEventType(str, enum.Enum):
@@ -45,7 +49,7 @@ class AgentEvent(BaseModel):
     model_config = {"frozen": True}  # 强制不可变
 
     event_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
-    event_type: str
+    event_type: AgentEventType
     request_id: str
     timestamp: float = Field(default_factory=time.time)
     iteration: int = 0
@@ -55,29 +59,23 @@ class AgentEvent(BaseModel):
     provider: str | None = None
     status: str = "ok"
     message: str | None = None
-    data: dict[str, typing.Any] = Field(default_factory=dict)
+    data: dict[str, typing.Any] = Field(
+        default_factory=dict,
+        description="约定只读，监听器/消费者不得原地修改",
+    )
     latency_seconds: float | None = None
     retryable: bool = False
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: typing.Any) -> dict[str, typing.Any]:
+        """序列化时统一脱敏 data，保证 model_dump 与 to_jsonl 路径一致。"""
+        payload = handler(self)
+        payload["data"] = _redact(dict(payload.get("data") or {}))
+        return payload
+
     def for_audit(self) -> dict[str, typing.Any]:
         """返回一个脱敏后的 JSON 安全字典。"""
-        redacted = _redact(dict(self.data or {}))
-        return {
-            "event_id": self.event_id,
-            "event_type": self.event_type,
-            "request_id": self.request_id,
-            "timestamp": self.timestamp,
-            "iteration": self.iteration,
-            "node": self.node,
-            "tool": self.tool,
-            "model": self.model,
-            "provider": self.provider,
-            "status": self.status,
-            "message": self.message,
-            "latency_seconds": self.latency_seconds,
-            "retryable": self.retryable,
-            "data": redacted,
-        }
+        return self.model_dump(mode="json")
 
 
 class AgentAuditTrail(BaseModel):
@@ -87,7 +85,7 @@ class AgentAuditTrail(BaseModel):
     events: list[AgentEvent] = Field(default_factory=list)
     started_at: float = Field(default_factory=time.time)
     completed_at: float | None = None
-    
+
     # 内部监听器列表，不参与序列化
     _listeners: list[AgentEventListener] = []
 
@@ -98,16 +96,25 @@ class AgentAuditTrail(BaseModel):
 
     def record(self, event: AgentEvent) -> None:
         """追加事件，并通知所有已注册的监听器。"""
+        if event.request_id != self.request_id:
+            logger.warning(
+                f"事件 request_id 不匹配 | expected={self.request_id} | actual={event.request_id}"
+            )
         self.events.append(event)
         for listener in self._listeners:
             try:
                 listener.on_event(event)
-            except Exception:
-                # 监听器报错不应阻断主业务流程
-                pass
+            except Exception as exc:
+                # 监听器报错不应阻断主业务流程，但要留痕
+                logger.warning(
+                    f"监听器执行失败 | listener={type(listener).__name__} | error={exc!s}"
+                )
 
     def record_now(self, **fields: typing.Any) -> AgentEvent:
-        """创建、追加并返回一个事件。"""
+        """创建、追加并返回一个事件。
+
+        fields 会传给 AgentEvent；不要传 request_id，它由轨迹自动填充。
+        """
         event = AgentEvent(request_id=self.request_id, **fields)
         self.record(event)
         return event
@@ -128,7 +135,10 @@ class AgentAuditTrail(BaseModel):
         providers = _collect_unique(self.events, "provider")
         tools = _collect_unique(self.events, "tool")
         failures = [event for event in self.events if event.status == "error"]
-        fallback_events = [event for event in self.events if event.event_type == AgentEventType.MODEL_FALLBACK.value]
+        fallback_events = [
+            event for event in self.events
+            if event.event_type == AgentEventType.MODEL_FALLBACK
+        ]
         return {
             "request_id": self.request_id,
             "event_count": len(self.events),
@@ -141,7 +151,7 @@ class AgentAuditTrail(BaseModel):
             "iterations": _max_iteration(self.events),
             "failure_count": len(failures),
             "fallback_count": len(fallback_events),
-            "failure_types": sorted({event.event_type for event in failures}),
+            "failure_types": sorted({event.event_type.value for event in failures}),
         }
 
     def to_jsonl(self) -> str:
@@ -167,20 +177,35 @@ class LoggingAgentEventListener(AgentEventListener):
         self._only = set(only_types) if only_types else None
 
     def on_event(self, event: AgentEvent) -> None:
-        if self._only and event.event_type not in self._only:
+        if self._only and event.event_type.value not in self._only:
             return
-        
+
         # 兼容标准 logging 库，使用 extra 传递结构化字段
         extra_info = event.for_audit()
         self._logger.info(
             f"agent_event | type={event.event_type} | node={event.node or 'N/A'}", agent_event=extra_info)
 
 
+_SENSITIVE_HINTS = (
+    "api_key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "credential",
+    "bearer",
+)
+
+
 def _redact(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
+    """递归脱敏；键名包含敏感关键词即替换为 [redacted]。
+
+    只处理 dict 的键名；list 中的裸字符串（如 headers 里的 "Authorization: Bearer x"）不在覆盖范围。
+    """
     cleaned: dict[str, typing.Any] = {}
-    sensitive = {"api_key", "token", "secret", "password", "authorization", "credential"}
     for key, value in payload.items():
-        if isinstance(key, str) and key.lower() in sensitive:
+        if isinstance(key, str) and any(hint in key.lower() for hint in _SENSITIVE_HINTS):
             cleaned[key] = "[redacted]"
         elif isinstance(value, dict):
             cleaned[key] = _redact(value)

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import typing
 
 from pydantic import BaseModel, Field
@@ -17,7 +18,6 @@ from observability import get_logger
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from model.embedding import EmbeddingModel
-    from rag.agent_events import AgentAuditTrail
     from rag.retrieval import RetrievalPipeline
     from rag.types import RetrievedContext
     from settings import GuardrailsSettings, RetrievalSettings
@@ -37,7 +37,7 @@ class AnswerRequest(BaseModel):
     allowed_sources: list[str] = Field(default_factory=list)
     top_k: int | None = None
     history: list[dict[str, str]] = Field(default_factory=list)
-    model: str | None = None
+    model: str | None = Field(default=None, description="预留：当前由服务端配置决定，暂未使用")
     use_case: str = "chat"
 
 
@@ -104,7 +104,7 @@ class RAGService:
     async def aanswer(self, request: AnswerRequest) -> AnswerResult:
         """异步执行一次检索优先的直接回答。"""
         self._validate_request(request)
-        context = self._retrieve(request)
+        context = await asyncio.to_thread(self._retrieve, request)
         prompt_messages = self._build_prompt(request.question, context, request.history)
 
         result = await self._executor.ainvoke(ChatRequest(messages=prompt_messages))
@@ -166,7 +166,7 @@ class RAGService:
                 "prompt_tokens": response.prompt_tokens,
                 "completion_tokens": response.completion_tokens,
             },
-            attempted_models=self._executor.providers,
+            attempted_models=[attempt.model_name for attempt in result.attempts],
             fallback_used=fallback_used,
         )
 
@@ -174,9 +174,9 @@ class RAGService:
         self, question: str, context: RetrievedContext, history: list[dict[str, str]]
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [{"role": "system", "content": _SYSTEM_PROMPT}]
-        history_limit = max(0, self._guardrails.max_history_messages)
+        history_limit = max(0, getattr(self._guardrails, "max_history_messages", 8))
 
-        for entry in history[-history_limit:]:
+        for entry in (history[-history_limit:] if history_limit else []):
             role = entry.get("role")
             if role not in {"user", "assistant"}:
                 continue
@@ -209,7 +209,7 @@ class RAGService:
         question = (request.question or "").strip()
         if not question:
             raise ValidationError("问题内容不能为空。")
-        limit = getattr(self._guardrails, "max_question_length", 0) or 2000
+        limit = getattr(self._guardrails, "max_question_length", 2000)
         if len(question) > limit:
             raise ValidationError(f"问题长度超出了 {limit} 字符的最大限制。")
 
@@ -219,41 +219,10 @@ def _format_context(context: RetrievedContext) -> str:
         return "（当前问题没有检索到可引用的知识库内容）"
     blocks: list[str] = []
     for index, document in enumerate(context.documents, start=1):
-        location = f"第{document.page}页" if isinstance(document.page, int) and document.page > 0 else ""
+        location = f"第{document.page}页" if document.page is not None and document.page > 0 else ""
         header = f"[{index}] {document.title or document.source}{(' ' + location).rstrip()}"
         blocks.append(f"{header}\n{document.content}")
     return "\n\n".join(blocks)
-
-
-def build_answer_result_from_agent(
-    answer: str,
-    query: str,
-    context: RetrievedContext,
-    response: ChatResponse | None,
-    attempted_models: list[str],
-    fallback_used: bool,
-    trail: AgentAuditTrail,
-) -> AnswerResult:
-    """从智能体执行结果构建 AnswerResult。"""
-    return AnswerResult(
-        answer=answer,
-        query=query,
-        context=context,
-        citations=[
-            Citation(
-                index=index,
-                source=document.source,
-                title=document.title,
-                page=document.page,
-                chunk_id=document.chunk_id,
-            )
-            for index, document in enumerate(context.documents, start=1)
-        ],
-        context_used=not context.is_empty(),
-        model=response.model if response else None,
-        attempted_models=attempted_models,
-        fallback_used=fallback_used,
-    )
 
 
 __all__ = [
@@ -262,5 +231,4 @@ __all__ = [
     "Citation",
     "ModelExecutionFailed",
     "RAGService",
-    "build_answer_result_from_agent",
 ]

@@ -24,7 +24,9 @@ from model import ChatRequest, FallbackExecutor
 from observability import get_logger, get_metric
 from rag.agent_events import (
     AgentAuditTrail,
+    AgentEvent,
     AgentEventType,
+    AgentEventListener,
     LoggingAgentEventListener,
 )
 from rag.retrieval import RetrievedContext
@@ -106,6 +108,7 @@ class AgentDependencies:
         guardrails: Guardrails,
         agent_settings: AgentSettings,
         guardrails_settings: GuardrailsSettings,
+        listener: AgentEventListener | None = None,
     ) -> None:
         self.executor = executor
         self.rag_service = rag_service
@@ -113,6 +116,7 @@ class AgentDependencies:
         self.guardrails = guardrails
         self.agent_settings = agent_settings
         self.guardrails_settings = guardrails_settings
+        self.listener = listener
 
 
 class AgentState(BaseModel):
@@ -125,7 +129,9 @@ class AgentState(BaseModel):
     allowed_sources: list[str] = Field(default_factory=list)
     additional_context: str | None = None
     messages: list[dict[str, typing.Any]] = Field(default_factory=list)
-    trail: AgentAuditTrail = Field(default_factory=lambda: AgentAuditTrail(request_id=""))
+    # 纯数据事件列表：可被 model_dump / LangGraph 往返，不丢事件。
+    # 审计轨迹在 _build_agent_response 里一次性构造。
+    events: list[AgentEvent] = Field(default_factory=list)
     iterations: int = 0
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     citations: list[dict[str, typing.Any]] = Field(default_factory=list)
@@ -164,6 +170,26 @@ def build_agent(dependencies: AgentDependencies) -> typing.Any:
     return graph.compile()
 
 
+def _record(
+    state: AgentState,
+    event_type: AgentEventType,
+    *,
+    listener: AgentEventListener | None = None,
+    **fields: typing.Any,
+) -> AgentEvent:
+    """向状态追加审计事件，并通知监听器；监听器失败不阻断主流程。"""
+    event = AgentEvent(event_type=event_type.value, request_id=state.request_id, **fields)
+    state.events.append(event)
+    if listener is not None:
+        try:
+            listener.on_event(event)
+        except Exception as exc:
+            logger.warning(
+                "listener_failed | listener=%s | error=%s", type(listener).__name__, exc
+            )
+    return event
+
+
 class _ReasonNode:
     """使用执行器决定是调用工具还是直接回答。"""
 
@@ -187,8 +213,9 @@ class _ReasonNode:
         except Exception:
             tools_for_model = []
 
-        state.trail.record_now(
-            event_type=AgentEventType.ITERATION_STARTED,
+        _record(
+            state, AgentEventType.ITERATION_STARTED,
+            listener=self._dependencies.listener,
             iteration=next_iteration,
             node="reason",
         )
@@ -197,7 +224,7 @@ class _ReasonNode:
         request = ChatRequest(messages=messages, tools=tools_for_model)
 
         response, used_fallback, attempted_models = _invoke_with_fallback(
-            executor, request, state
+            executor, request, state, self._dependencies.listener
         )
 
         assistant_message: dict[str, typing.Any] = {
@@ -210,8 +237,9 @@ class _ReasonNode:
                 for call in response.tool_calls
             ]
 
-        state.trail.record_now(
-            event_type=AgentEventType.REASONING,
+        _record(
+            state, AgentEventType.REASONING,
+            listener=self._dependencies.listener,
             iteration=next_iteration,
             node="reason",
             model=response.model,
@@ -222,6 +250,7 @@ class _ReasonNode:
         next_state: dict[str, typing.Any] = {
             "messages": [*list(state.messages), assistant_message],
             "iterations": next_iteration,
+            "events": state.events,
             "model": response.model or state.model,
             "attempted_models": list(
                 dict.fromkeys([*state.attempted_models, *attempted_models])
@@ -250,6 +279,7 @@ class _ToolNode:
         records: list[ToolCallRecord] = list(state.tool_calls)
         scratchpad: dict[str, typing.Any] = dict(state.scratchpad)
         documents: list[dict[str, typing.Any]] = list(state.documents)
+        updated_messages = list(state.messages)
 
         tool_calls_metric = get_metric("tool_calls_total")
 
@@ -260,8 +290,9 @@ class _ToolNode:
 
             guardrails.check_tool_calls(len(records) + 1)
             guardrails.validate_tool_call(name, registry)
-            state.trail.record_now(
-                event_type=AgentEventType.TOOL_CALL_REQUESTED,
+            _record(
+                state, AgentEventType.TOOL_CALL_REQUESTED,
+                listener=self._dependencies.listener,
                 iteration=state.iterations,
                 node="execute_tool",
                 tool=name,
@@ -271,13 +302,22 @@ class _ToolNode:
             record = _invoke_tool(registry, name, arguments, call_id, state)
             records.append(record)
             scratchpad[call_id] = record.result
+            updated_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": _serialize_tool_result(record.result),
+                }
+            )
 
             if tool_calls_metric:
                 tool_calls_metric.labels(tool=name, status=record.status).inc()
 
             if record.status == "error":
-                state.trail.record_now(
-                    event_type=AgentEventType.TOOL_CALL_FAILED,
+                _record(
+                    state, AgentEventType.TOOL_CALL_FAILED,
+                    listener=self._dependencies.listener,
                     iteration=state.iterations,
                     node="execute_tool",
                     tool=name,
@@ -286,8 +326,9 @@ class _ToolNode:
                     retryable=False,
                 )
             else:
-                state.trail.record_now(
-                    event_type=AgentEventType.TOOL_CALL_SUCCEEDED,
+                _record(
+                    state, AgentEventType.TOOL_CALL_SUCCEEDED,
+                    listener=self._dependencies.listener,
                     iteration=state.iterations,
                     node="execute_tool",
                     tool=name,
@@ -296,26 +337,16 @@ class _ToolNode:
                 )
 
             if name == registry.RETRIEVE_TOOL_NAME:
-                documents = _capture_retrieval_documents(record.result, documents, state.trail)
-
-        updated_messages = list(state.messages)
-        for call in calls:
-            name = call.get("name")
-            call_id = call.get("id") or uuid.uuid4().hex
-            updated_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": name,
-                    "content": _serialize_tool_result(scratchpad.get(call_id)),
-                }
-            )
+                documents = _capture_retrieval_documents(
+                    record.result, documents, state, self._dependencies.listener
+                )
 
         return {
             "messages": updated_messages,
             "tool_calls": records,
             "scratchpad": scratchpad,
             "documents": documents,
+            "events": state.events,
             "stopped_reason": "reason",
         }
 
@@ -332,8 +363,9 @@ class _FinalizeNode:
 
         if not answer:
             answer = "当前无法从已授权知识库中确认该问题，建议补充相关文档或联系知识库管理员。"
-            state.trail.record_now(
-                event_type=AgentEventType.GUARDRAIL_TRIGGERED,
+            _record(
+                state, AgentEventType.GUARDRAIL_TRIGGERED,
+                listener=self._dependencies.listener,
                 iteration=state.iterations,
                 node="finalize",
                 status="warning",
@@ -343,8 +375,9 @@ class _FinalizeNode:
         if not citations and state.documents:
             citations = [_document_to_citation(document) for document in state.documents]
 
-        state.trail.record_now(
-            event_type=AgentEventType.FINALIZED,
+        _record(
+            state, AgentEventType.FINALIZED,
+            listener=self._dependencies.listener,
             iteration=state.iterations,
             node="finalize",
             model=state.model,
@@ -354,6 +387,7 @@ class _FinalizeNode:
         return {
             "final_answer": answer,
             "citations": citations,
+            "events": state.events,
             "stopped_reason": "completed",
         }
 
@@ -368,6 +402,7 @@ def _invoke_with_fallback(
     executor: FallbackExecutor,
     request: ChatRequest,
     state: AgentState,
+    listener: AgentEventListener | None = None,
 ) -> tuple[ChatResponse, bool, list[str]]:
     """调用执行器并记录每一次模型尝试的审计轨迹。
 
@@ -379,8 +414,9 @@ def _invoke_with_fallback(
     result = executor.invoke(request)
 
     for attempt in result.attempts:
-        state.trail.record_now(
-            event_type=AgentEventType.MODEL_CALL,
+        _record(
+            state, AgentEventType.MODEL_CALL,
+            listener=listener,
             iteration=state.iterations + 1,
             node="reason",
             model=attempt.model_name,
@@ -391,8 +427,9 @@ def _invoke_with_fallback(
         )
 
         if attempt.status == "success" and attempt.provider != executor.providers[0]:
-            state.trail.record_now(
-                event_type=AgentEventType.MODEL_FALLBACK,
+            _record(
+                state, AgentEventType.MODEL_FALLBACK,
+                listener=listener,
                 iteration=state.iterations + 1,
                 node="reason",
                 provider=attempt.provider,
@@ -400,7 +437,7 @@ def _invoke_with_fallback(
                 data={"attempt": len(result.attempts)},
             )
 
-    if not result.succeeded or not result.response:
+    if not result.succeeded or result.response is None:
         raise AgentExecutionError(
             "智能体推理阶段所有配置的模型均调用失败。",
             details={
@@ -446,7 +483,10 @@ def _invoke_tool(
 
 
 def _capture_retrieval_documents(
-    result: typing.Any, existing: list[dict[str, typing.Any]], trail: AgentAuditTrail
+    result: typing.Any,
+    existing: list[dict[str, typing.Any]],
+    state: AgentState,
+    listener: AgentEventListener | None = None,
 ) -> list[dict[str, typing.Any]]:
     """将检索结果转换为可审计的文档摘要。"""
     documents = list(existing)
@@ -457,8 +497,9 @@ def _capture_retrieval_documents(
     else:
         return documents
 
-    trail.record_now(
-        event_type=AgentEventType.RETRIEVAL,
+    _record(
+        state, AgentEventType.RETRIEVAL,
+        listener=listener,
         node="execute_tool",
         data={"document_count": len(context.documents)},
     )
@@ -477,8 +518,9 @@ def _capture_retrieval_documents(
                 "snippet": _extract_snippet(document.content),
             }
         )
-    trail.record_now(
-        event_type=AgentEventType.CONTEXT_UPDATED,
+    _record(
+        state, AgentEventType.CONTEXT_UPDATED,
+        listener=listener,
         node="execute_tool",
         data={"total_documents": len(documents)},
     )
@@ -557,8 +599,9 @@ class AgentRunner:
 
     def run(self, request: AgentRequest) -> AgentResponse:
         state = self._build_state(request)
-        state.trail.record_now(
-            event_type=AgentEventType.STARTED,
+        _record(
+            state, AgentEventType.STARTED,
+            listener=self._dependencies.listener,
             node="agent",
             data={
                 "tenant_id": request.tenant_id,
@@ -567,19 +610,16 @@ class AgentRunner:
             },
         )
         start_time = time.perf_counter()
-        # 已知问题 P1-1：state.model_dump() 会把 trail 序列化为 dict，
-        # 图节点在新 trail 上打点；STARTED / complete() 仍作用于外层旧 trail，
-        # 最终响应会丢首尾事件。修复需 agent_events 提供共享/合并机制。
         final_state = self._run_to_completion(state.model_dump())
-        state.trail.complete()
         return _build_agent_response(
             request, final_state, time.perf_counter() - start_time
         )
 
     async def arun(self, request: AgentRequest) -> AgentResponse:
         state = self._build_state(request)
-        state.trail.record_now(
-            event_type=AgentEventType.STARTED,
+        _record(
+            state, AgentEventType.STARTED,
+            listener=self._dependencies.listener,
             node="agent",
             data={
                 "tenant_id": request.tenant_id,
@@ -588,27 +628,36 @@ class AgentRunner:
             },
         )
         start_time = time.perf_counter()
-        final_state = await self._graph.ainvoke(state.model_dump())
-        state.trail.complete()
+        try:
+            final_state = await self._graph.ainvoke(state.model_dump())
+        except (AgentExecutionError, ValidationError, RAGError):
+            raise
+        except Exception as exc:
+            raise AgentExecutionError(
+                f"智能体执行过程中发生意外失败: {exc}",
+                details={"request_id": request.request_id},
+            ) from exc
         return _build_agent_response(
             request, final_state, time.perf_counter() - start_time
         )
 
     def stream(self, request: AgentRequest) -> typing.Iterator[dict[str, typing.Any]]:
         state = self._build_state(request)
-        state.trail.record_now(event_type=AgentEventType.STARTED, node="agent")
+        _record(
+            state, AgentEventType.STARTED,
+            listener=self._dependencies.listener, node="agent",
+        )
         try:
             for event in self._graph.stream(state.model_dump()):
                 yield _normalize_event(request.request_id, event)
         except ValidationError:
             raise
         except GeneratorExit:
-            # 消费者提前关闭生成器：仍需收尾审计，然后按规范重新抛出
-            state.trail.complete()
             raise
         except Exception as exc:
-            state.trail.record_now(
-                event_type=AgentEventType.FAILED,
+            _record(
+                state, AgentEventType.FAILED,
+                listener=self._dependencies.listener,
                 node="agent",
                 status="error",
                 message=str(exc),
@@ -619,9 +668,7 @@ class AgentRunner:
                 "error_type": type(exc).__name__,
                 "message": str(exc),
             }
-            state.trail.complete()
         else:
-            state.trail.complete()
             yield {"request_id": request.request_id, "event": "completed"}
 
     def _run_to_completion(self, state_dict: dict[str, typing.Any]) -> typing.Any:
@@ -636,12 +683,6 @@ class AgentRunner:
             ) from exc
 
     def _build_state(self, request: AgentRequest) -> AgentState:
-        trail = AgentAuditTrail(request_id=request.request_id)
-
-        listener = LoggingAgentEventListener(logger, only_types=None)
-        if hasattr(trail, "add_listener"):
-            trail.add_listener(listener)
-
         return AgentState(
             request_id=request.request_id,
             question=request.question,
@@ -650,7 +691,6 @@ class AgentRunner:
             allowed_sources=list(request.allowed_sources),
             additional_context=request.additional_context,
             messages=_history_messages(request),
-            trail=trail,
         )
 
 
@@ -684,6 +724,14 @@ def _build_agent_response(
     request: AgentRequest, final_state: typing.Any, elapsed_seconds: float
 ) -> AgentResponse:
     state = final_state if isinstance(final_state, AgentState) else AgentState(**final_state)
+
+    # 在图执行结束后一次性构造审计轨迹，避开序列化边界。
+    started_at = state.events[0].timestamp if state.events else time.time()
+    trail = AgentAuditTrail(
+        request_id=request.request_id, events=state.events, started_at=started_at
+    )
+    trail.complete()
+
     stopped_reason = state.stopped_reason
     if state.tool_calls and all(record.status == "error" for record in state.tool_calls):
         stopped_reason = "tool_error"
@@ -699,7 +747,7 @@ def _build_agent_response(
         documents=list(state.documents),
         attempted_models=list(state.attempted_models),
         fallback_used=state.fallback_used,
-        trail=state.trail,
+        trail=trail,
         duration_seconds=elapsed_seconds,
     )
 
@@ -743,6 +791,7 @@ def create_agent_runner(
         guardrails=Guardrails(guardrails_settings, agent_settings=agent_settings),
         agent_settings=agent_settings,
         guardrails_settings=guardrails_settings,
+        listener=LoggingAgentEventListener(logger, only_types=None),
     )
     return AgentRunner(build_agent(dependencies), dependencies)
 
