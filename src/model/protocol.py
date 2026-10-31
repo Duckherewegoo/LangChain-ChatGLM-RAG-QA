@@ -52,6 +52,7 @@ class ChatRequest(BaseModel):
                     ToolMessage(
                         content=content,
                         tool_call_id=message.get("tool_call_id", ""),
+                        name=message.get("name"),
                     )
                 )
             else:
@@ -85,7 +86,10 @@ class ChatModel(typing.Protocol):
     这意味着实现类不需要显式继承本类，只要方法签名一致即可。
     """
 
+    # provider 标识符，如 "zhipu" / "qwen" / "deepseek"；不是模型名。
     name: str
+    # 具体模型标识，如 "glm-4" / "qwen-max"；由各 provider 从 settings.model_name 填充。
+    model_name: str
 
     def invoke(self, request: ChatRequest) -> ChatResponse:
         """执行同步对话补全。"""
@@ -96,7 +100,10 @@ class ChatModel(typing.Protocol):
         ...
 
     def bind_tools(self, tools: Sequence[dict[str, Any]]) -> "ChatModel":
-        """返回一个配置了指定工具的模型实例。"""
+        """返回一个配置了指定工具的模型实例。
+
+        当前由 model.health 的健康检查使用；执行路径通过 ChatRequest.tools 传工具。
+        """
         ...
 
 

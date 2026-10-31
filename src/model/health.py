@@ -74,7 +74,8 @@ def check_provider(
     started = time.perf_counter()
 
     # 优先使用协议中定义的 model_name，若没有则回退到 name
-    model_name = getattr(model, "model_name", model.name)
+
+    model_name = model.model_name
     configured = bool(getattr(model, "is_configured", True))
 
     health = ProviderHealth(

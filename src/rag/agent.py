@@ -426,7 +426,7 @@ def _invoke_with_fallback(
             message=attempt.error_message if attempt.status != "success" else None,
         )
 
-        if attempt.status == "success" and attempt.provider != executor.providers[0]:
+        if attempt.status == "success" and result.fallback_used:
             _record(
                 state, AgentEventType.MODEL_FALLBACK,
                 listener=listener,
@@ -453,7 +453,7 @@ def _invoke_with_fallback(
             },
         )
 
-    used_fallback = len(result.attempts) > 1
+    used_fallback = result.fallback_used
     attempted_models = list(
         dict.fromkeys(
             attempt.model_name

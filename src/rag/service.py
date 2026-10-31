@@ -139,7 +139,7 @@ class RAGService:
         raise ModelExecutionFailed(
             "所有配置的对话模型均无法生成响应。",
             details={
-                "attempts": [attempt.model_dump() for attempt in result.attempts],
+                "attempts": result.summary()["attempts"],
                 "use_case": use_case,
             },
         )
@@ -152,8 +152,7 @@ class RAGService:
         result: FallbackResult,
     ) -> AnswerResult:
         """统一构建最终响应对象。"""
-        # 正确判断是否触发回退：成功的尝试不是第一个，或者尝试次数大于1且发生了失败
-        fallback_used = len(result.attempts) > 1
+        fallback_used = result.fallback_used
 
         return AnswerResult(
             answer=response.content,

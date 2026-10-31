@@ -46,7 +46,12 @@ class ModelRoute:
         """按执行顺序返回模型名称。"""
         return [self.primary_name, *(name for name, _ in self.secondaries)]
 
-    def build_executor(self, *, max_attempts_per_provider: int = 1) -> "FallbackExecutor":
+    def build_executor(
+        self,
+        *,
+        max_attempts_per_provider: int = 1,
+        max_total_attempts: int | None = None,
+    ) -> "FallbackExecutor":
         """使用解析后的模型链创建 Fallback 执行器。"""
         from model.fallback import FallbackExecutor
 
@@ -54,8 +59,8 @@ class ModelRoute:
             self.primary,
             [model for _, model in self.secondaries],
             max_attempts_per_provider=max_attempts_per_provider,
+            max_total_attempts=max_total_attempts,
         )
-
 
 class ModelRouter:
     """解析用例到模型链，不负责实际调用。"""
