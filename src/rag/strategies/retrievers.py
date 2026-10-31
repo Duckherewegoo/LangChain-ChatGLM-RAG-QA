@@ -42,14 +42,21 @@ class VectorRetrievalStrategy(RetrievalStrategy):
             allowed_sources=list(allowed_sources) if allowed_sources else None,
             owner_id=owner_id,
         )
-        return [
-            Candidate(document=doc, score=doc.score, source="vector", rank=rank)
-            for rank, doc in enumerate(context.documents)
-        ]
+        # 优先使用 pipeline 重排后的 rerank_score；未重排时回退到原始向量分数。
+        # 若丢弃 rerank_score，fuser 会看到"未重排的分数"配上"已重排的顺序"，
+        # 造成混合检索里排序与分数不匹配，并使 pipeline 里跑过的 cross-encoder
+        # 结果被丢弃。
+        candidates: list[Candidate] = []
+        for rank, doc in enumerate(context.documents):
+            score = doc.rerank_score if doc.rerank_score is not None else doc.score
+            candidates.append(
+                Candidate(document=doc, score=score, source="vector", rank=rank)
+            )
+        return candidates
 
 
 class KeywordRetrievalStrategy(RetrievalStrategy):
-    """BM25 式关键词检索。"""
+    """关键词检索：查询 BM25Index 并按最大值归一化分数。"""
     name = "keyword"
 
     def __init__(self, index: "BM25Index", *, tokenizer: typing.Callable[[str], list[str]] | None = None) -> None:
@@ -65,6 +72,10 @@ class KeywordRetrievalStrategy(RetrievalStrategy):
             tokens, tenant_id=tenant_id, owner_id=owner_id,
             allowed_sources=list(allowed_sources) if allowed_sources else None, top_k=top_k
         )
+        # 用 max 归一化把分数映射到 [0, 1]，让第一名恒为 1.0。
+        # 注意：这不是加权融合所需的量纲对齐——如果 fuser 用加权求和，
+        # keyword 分支会系统性偏高分。加权融合应改用 min-max 或 z-score；
+        # RRF（按 rank）不受此影响。
         maximum = max((score for _, score in results), default=1.0) or 1.0
         return [
             Candidate(document=document, score=score / maximum, source="keyword", rank=rank)
@@ -81,15 +92,34 @@ class BM25Index(abc.ABC):
     ) -> list[tuple[RetrievedDocument, float]]:
         ...
 
+    @abc.abstractmethod
+    def add(self, documents: typing.Iterable[RetrievedDocument]) -> None:
+        ...
+
+    @abc.abstractmethod
+    def remove_by_document(self, document_id: str, tenant_id: str | None = None) -> int:
+        """删除匹配 document_id（可选 tenant_id）的所有 chunk，返回删除数。"""
+        ...
+
 
 class InMemoryBM25Index(BM25Index):
-    """可注入打分器与词频提取器的内存索引。"""
+    """内存关键词索引。
+
+    实现说明：打分函数是 TF-IDF 近似（tf * idf / sqrt(doc_len)），
+    不是标准 BM25（缺少 k1/b 参数与 avgdl 归一化）。类名保留 BM25
+    以兼容现有引用；如需严格 BM25，可注入自定义 scorer。
+
+    幂等性：add 按 chunk_id 去重，重复摄入不会重复累加。
+    删除：remove_by_document 按 document_id 移除，与 vector_store 的
+    delete_by_document 对齐。
+    """
 
     def __init__(
         self, *, tokenizer: typing.Callable[[str], list[str]] | None = None,
         scorer: typing.Callable[[list[str], list[str], dict[str, float]], float] | None = None,
     ) -> None:
         self._documents: list[RetrievedDocument] = []
+        self._chunk_ids: set[str] = set()
         self._tokenize = tokenizer or _default_tokenize
         self._scorer = scorer or _tfidf_score
         self._doc_freq: dict[str, int] = {}
@@ -99,12 +129,40 @@ class InMemoryBM25Index(BM25Index):
 
     def add(self, documents: typing.Iterable[RetrievedDocument]) -> None:
         for document in documents:
+            if document.chunk_id in self._chunk_ids:
+                continue  # 幂等：已存在的 chunk 跳过
             self._documents.append(document)
+            self._chunk_ids.add(document.chunk_id)
             tokens = self._tokenize(document.content)
             for token in set(tokens):
                 self._doc_freq[token] = self._doc_freq.get(token, 0) + 1
             self._total += 1
         self._cache_dirty = True
+
+    def remove_by_document(self, document_id: str, tenant_id: str | None = None) -> int:
+        """删除匹配 document_id（可选 tenant_id）的所有 chunk，返回删除数。"""
+        remaining: list[RetrievedDocument] = []
+        removed = 0
+        for document in self._documents:
+            matches = document.document_id == document_id and (
+                tenant_id is None or document.tenant_id == tenant_id
+            )
+            if not matches:
+                remaining.append(document)
+                continue
+            for token in set(self._tokenize(document.content)):
+                freq = self._doc_freq.get(token, 0) - 1
+                if freq <= 0:
+                    self._doc_freq.pop(token, None)
+                else:
+                    self._doc_freq[token] = freq
+            self._chunk_ids.discard(document.chunk_id)
+            self._total -= 1
+            removed += 1
+        if removed:
+            self._documents = remaining
+            self._cache_dirty = True
+        return removed
 
     def __len__(self) -> int:
         return len(self._documents)
@@ -141,15 +199,16 @@ def _matches_scope(
     """判断文档是否在当前检索主体的可见范围内。
 
     三条独立红线，任何一条不满足即拒绝：
-      1. 租户隔离：document.tenant_id 非空时必须精确匹配请求的 tenant_id。
+      1. 租户隔离：document.tenant_id 必须精确匹配请求的 tenant_id
+         （空值不视为通配，避免跨租户泄露）。
       2. 归属隔离：请求指定 owner_id 时，document.owner_id 必须严格匹配；
          None 不被视为通配。
       3. 来源白名单：allowed_sources 非空时，document.source 必须命中。
 
-    约束与 RetrievalPipeline._is_authorized 保持一致，避免向量路径和
-    关键词路径在同一请求下返回不同的可见范围。
+    与 RetrievalPipeline._is_authorized 覆盖同一可见范围，但各自负责本层
+    能做的过滤（pipeline 依赖 store 侧做 tenant/sources，本层在内存全量过滤）。
     """
-    if document.tenant_id and document.tenant_id != tenant_id:
+    if document.tenant_id != tenant_id:
         return False
     if owner_id is not None:
         if getattr(document, "owner_id", None) != owner_id:

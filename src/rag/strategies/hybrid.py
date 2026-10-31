@@ -59,10 +59,12 @@ class HybridRetrieval:
     ) -> RetrievalContext:
         """执行完整链路：改写 -> 多路召回 -> 融合。"""
         rewrite = self._rewriter.rewrite(question)
+        # all_queries() 只调一次：若返回生成器，第二次调用会拿到空序列。
+        queries = list(rewrite.all_queries())
         all_candidates: list[Candidate] = []
         per_query: list[dict[str, typing.Any]] = []
 
-        for query in rewrite.all_queries():
+        for query in queries:
             for label, strategy in self._strategies:
                 candidates = strategy.retrieve(
                     query, tenant_id=tenant_id, top_k=self._per_query_top_k,
@@ -72,14 +74,22 @@ class HybridRetrieval:
                 all_candidates.extend(candidates)
 
         fused = self._fuser.fuse(all_candidates, top_k=top_k)
+        strategy_labels = [label for label, _ in self._strategies]
         context = RetrievalContext(
             query=question,
             documents=[entry.document for entry in fused],
-            search_type="hybrid" if len(self._strategies) > 1 else self._strategies[0][0],
-            rewrite=rewrite, candidates=all_candidates, strategy_notes=per_query,
+            search_type="hybrid" if len(strategy_labels) > 1 else strategy_labels[0],
+            rewrite=rewrite,
+            # candidates 是全量原始候选（含 content 全文），仅用于审计/调试。
+            # 对外序列化时应排除该字段（体积可能为 documents 的 10 倍以上）。
+            candidates=all_candidates,
+            strategy_notes=per_query,
         )
         logger.info(
-            f"混合检索完成 | 改写方法={rewrite.method} | 查询数={len(rewrite.all_queries())} | "
-            f"策略={[label for label, _ in self._strategies]} | 融合结果={len(fused)}"
+            "混合检索完成 | 改写方法=%s | 查询数=%d | 策略=%s | 融合结果=%d",
+            rewrite.method,
+            len(queries),
+            strategy_labels,
+            len(fused),
         )
         return context

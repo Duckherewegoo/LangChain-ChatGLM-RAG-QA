@@ -14,15 +14,21 @@ if typing.TYPE_CHECKING:  # 仅用于类型检查
     from sentence_transformers import CrossEncoder
 
 
-class RerankerUnavailable(RuntimeError):
-    """当配置的重排序器无法加载时抛出。"""
+class RerankerError(RuntimeError):
+    """重排器错误基类。"""
 
 
-class RerankerOutputError(RerankerUnavailable):
-    """当重排器输出与输入不一致时抛出。
+class RerankerUnavailable(RerankerError):
+    """配置的重排器无法加载（依赖缺失或模型加载失败）。
 
-    继承 RerankerUnavailable 是为了向后兼容既有捕获点，但语义上区分于
-    "模型加载失败"——这表示模型正常返回了，但结果不可信。
+    调用方通常应降级到 IdentityReranker 或跳过重排。
+    """
+
+
+class RerankerOutputError(RerankerError):
+    """重排器正常返回但输出与输入不一致。
+
+    调用方应告警或拒绝，不应静默降级——输出不一致意味着结果不可信。
     """
 
 
@@ -45,7 +51,11 @@ class Reranker(ABC):
         documents: typing.Sequence[RetrievedDocument],
         top_k: int = 4,
     ) -> list[RerankResult]:
-        """返回按重排分数排序的头部文档。"""
+        """返回按重排分数排序的头部文档。
+
+        top_k 默认 4 是给独立使用者的便利值；RetrievalPipeline 内部调用时
+        会传 len(evidence) 以处理全部候选。
+        """
         ...
 
 
@@ -140,7 +150,11 @@ def register_reranker(name: str, factory: RerankerFactory) -> None:
 
 
 def create_reranker(enabled: bool, model_name: str) -> Reranker:
-    """创建配置的重排器，或直通回退。"""
+    """创建配置的重排器。
+
+    enabled=False：返回 IdentityReranker。
+    enabled=True：返回 CrossEncoderReranker（registry 有覆盖则用覆盖）。
+    """
     if not enabled:
         factory = _REGISTRY.get("identity")
         if factory is None:
@@ -155,7 +169,7 @@ def create_reranker(enabled: bool, model_name: str) -> Reranker:
 
 # 两个内置工厂：签名统一为 (model_name: str) -> Reranker，
 # IdentityReranker 忽略该参数。
-register_reranker("cross_encoder", lambda model_name: CrossEncoderReranker(model_name))
+register_reranker("cross_encoder", CrossEncoderReranker)
 register_reranker("identity", lambda _model_name: IdentityReranker())
 
 
@@ -164,6 +178,7 @@ __all__ = [
     "IdentityReranker",
     "RerankResult",
     "Reranker",
+    "RerankerError",
     "RerankerFactory",
     "RerankerOutputError",
     "RerankerUnavailable",
