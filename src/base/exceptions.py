@@ -1,131 +1,193 @@
-"""RAG 服务的领域异常定义。
+"""向量集合策略与嵌入维度治理。
 
-这些异常用于区分配置、校验、模型、检索和智能体故障，
-以便应用层能够选择适当的 HTTP 状态码和可观测性动作，
-而无需解析错误字符串。
+不同的 Embedding 模型会产生不兼容的向量几何结构。本模块为每个模型分配一个持久化的指纹，
+据此推导出唯一的集合名称，并拒绝打开维度与当前 Embedder 不一致的现有集合。
+这可以防止运维人员在未重建索引的情况下替换 Embedding 模型所导致的静默数据损坏。
 """
 
 from __future__ import annotations
 
-from typing import Any
+import hashlib
+import re
+import typing
+
+from pydantic import BaseModel
+
+from base.exceptions import CollectionCompatibilityError, ConfigurationError
+
+if typing.TYPE_CHECKING:  # 仅用于类型检查
+    from model.embedding import EmbeddingModel
+    from settings import VectorStoreSettings
+
+_FINGERPRINT_VERSION = 1
+_SAFE_NAME = re.compile(r"[^a-zA-Z0-9_\-]")
 
 
-class RAGError(Exception):
-    """所有项目错误的基类。"""
+class EmbeddingFingerprint(BaseModel):
+    """Embedding 配置的稳定身份标识。"""
 
-    status_code: int = 500
-    error_code: str = "rag_error"
+    model_name: str
+    dimension: int
+    normalize: bool
+    version: int = _FINGERPRINT_VERSION
+    digest: str = ""
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        details: dict[str, Any] | None = None,
-        trace_id: str | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.message = message
-        self.details = details or {}
-        # 补充 trace_id 用于全链路追踪
-        self.trace_id = trace_id
+    @property
+    def short_id(self) -> str:
+        """用于集合名称的紧凑哈希片段。"""
+        if self.digest:
+            return self.digest[:12]
+        return self.compute_digest()[:12]
 
-    def to_dict(self) -> dict[str, Any]:
-        """将异常转换为标准的字典格式，供 API 层直接返回。
+    def compute_digest(self) -> str:
+        """计算指纹的规范 SHA-256 摘要。"""
+        payload = f"v{self.version}|{self.model_name}|{self.dimension}|{self.normalize}".encode()
+        return hashlib.sha256(payload).hexdigest()
 
-        注意：details 是开发者诊断信息，可能包含模型名、尝试记录等内部标识，
-        对外暴露前应由 api/middleware 按需过滤。
-        """
-        payload = {
-            "error": self.error_code,
-            "message": self.message,
-            "details": self.details,
+    def with_digest(self) -> EmbeddingFingerprint:
+        """返回填充了摘要的副本。"""
+        return EmbeddingFingerprint(
+            model_name=self.model_name,
+            dimension=self.dimension,
+            normalize=self.normalize,
+            version=self.version,
+            digest=self.compute_digest(),
+        )
+
+
+class CollectionPolicy(BaseModel):
+    """将 Embedding 指纹映射到物理集合的规则。"""
+
+    base_name: str = "enterprise_knowledge"
+    strategy: str = "model_fingerprint"
+    max_name_length: int = 63
+
+    def resolve(self, fingerprint: EmbeddingFingerprint) -> str:
+        """返回当前 Embedding 模型对应的集合名称。"""
+        if self.strategy == "fixed":
+            return self._safe(self.base_name)
+
+        if self.strategy == "model_name":
+            return self._safe(f"{self.base_name}_{self._slug(fingerprint.model_name)}")
+
+        suffix = f"{fingerprint.dimension}d_{fingerprint.short_id}"
+        return self._safe(f"{self.base_name}_{suffix}")
+
+    def _safe(self, name: str) -> str:
+        """清洗非法字符，并在超长时优先保留唯一后缀。"""
+        cleaned = _SAFE_NAME.sub("_", name).strip("_")
+        if not cleaned:
+            raise ConfigurationError("解析出的集合名称为空。")
+
+        if len(cleaned) <= self.max_name_length:
+            return cleaned
+
+        # 安全截断：保留首部前缀和尾部的唯一哈希标识
+        half_len = self.max_name_length // 2
+        prefix = cleaned[:half_len]
+        suffix = cleaned[-(self.max_name_length - half_len):]
+        return f"{prefix}_{suffix}"
+
+    @staticmethod
+    def _slug(text: str) -> str:
+        return _SAFE_NAME.sub("_", text).strip("_").lower() or "unknown"
+
+
+def _extract_normalize(embedder: typing.Any) -> bool:
+    """优先从公共属性读取 normalize，回退到 _settings，再回退到 True。"""
+    normalize = getattr(embedder, "normalize", None)
+    if normalize is not None:
+        return bool(normalize)
+
+    settings = getattr(embedder, "_settings", None)
+    if settings is not None:
+        value = getattr(settings, "normalize", None)
+        if value is not None:
+            return bool(value)
+
+    return True
+
+
+def fingerprint_embedder(embedder: EmbeddingModel, model_name: str) -> EmbeddingFingerprint:
+    """从 Embedder 实例创建指纹。"""
+    dimension = getattr(embedder, "dimension", 0)
+    if not dimension:
+        raise ConfigurationError(
+            "Embedder 缺乏可测量的维度；在打开集合前必须先加载模型。",
+            details={"model_name": model_name},
+        )
+
+    return EmbeddingFingerprint(
+        model_name=model_name,
+        dimension=dimension,
+        normalize=_extract_normalize(embedder),
+    ).with_digest()
+
+
+def create_collection_policy(settings: VectorStoreSettings) -> CollectionPolicy:
+    """创建应用配置中声明的策略。"""
+    return CollectionPolicy(
+        base_name=settings.collection,
+        strategy=settings.collection_strategy,
+        max_name_length=settings.max_collection_name_length,
+    )
+
+
+def validate_compatibility(
+    policy: CollectionPolicy,
+    fingerprint: EmbeddingFingerprint,
+    stored_dimension: int | None,
+) -> str:
+    """返回集合名称，如果维度不兼容则抛出异常。"""
+    collection = policy.resolve(fingerprint)
+    if stored_dimension is None:
+        return collection
+
+    if stored_dimension != fingerprint.dimension:
+        raise CollectionCompatibilityError(
+            "现有集合的维度与当前 Embedding 模型不匹配。",
+            details={
+                "collection": collection,
+                "stored_dimension": stored_dimension,
+                "active_dimension": fingerprint.dimension,
+                "fingerprint": fingerprint.short_id,
+            },
+        )
+    return collection
+
+
+def describe_compatibility(
+    policy: CollectionPolicy,
+    fingerprint: EmbeddingFingerprint,
+    stored_dimension: int | None,
+) -> dict[str, typing.Any]:
+    """返回非抛出异常的兼容性摘要，用于诊断。"""
+    if stored_dimension is None:
+        return {
+            "collection": policy.resolve(fingerprint),
+            "compatible": True,
+            "status": "empty",
+            "active_dimension": fingerprint.dimension,
+            "stored_dimension": None,
         }
-        if self.trace_id:
-            payload["trace_id"] = self.trace_id
-        return payload
 
-    def __str__(self) -> str:
-        """日志打印时的字符串表示。"""
-        return f"[{self.error_code}] {self.message}"
-
-
-class ConfigurationError(RAGError):
-    """应用配置无效或不完整。"""
-    status_code = 500
-    error_code = "configuration_error"
-
-
-class ValidationError(RAGError):
-    """请求负载未通过业务校验。"""
-    status_code = 400
-    error_code = "validation_error"
-
-
-class ModelNotConfiguredError(RAGError):
-    """无法根据当前配置构建有效的模型客户端。配置缺失是永久性错误。"""
-    status_code = 500
-    error_code = "model_not_configured"
-
-
-class ModelInvocationError(RAGError):
-    """模型调用在配置的重试次数后仍然失败。"""
-    status_code = 502
-    error_code = "model_invocation_error"
-
-
-class DocumentLoadError(RAGError):
-    """文档无法打开或解码。"""
-    status_code = 400
-    error_code = "document_load_error"
-
-
-class IngestError(RAGError):
-    """文档摄入流水线失败。"""
-    status_code = 500
-    error_code = "ingest_error"
-
-
-class RetrievalError(RAGError):
-    """向量检索或重排失败。"""
-    status_code = 502
-    error_code = "retrieval_error"
-
-
-class AgentExecutionError(RAGError):
-    """智能体因触发守卫或不可恢复的工具错误而停止。"""
-    status_code = 502
-    error_code = "agent_execution_error"
-
-
-class ToolExecutionError(RAGError):
-    """智能体调用的工具执行失败（如参数不合法、外部 API 崩溃）。"""
-    status_code = 500
-    error_code = "tool_execution_error"
-
-
-class PermissionDeniedError(RAGError):
-    """用户或租户无权访问请求的资源。"""
-    status_code = 403
-    error_code = "permission_denied"
-
-
-class ResourceNotFoundError(RAGError):
-    """请求的租户、集合、文档或会话未找到。"""
-    status_code = 404
-    error_code = "resource_not_found"
+    compatible = stored_dimension == fingerprint.dimension
+    return {
+        "collection": policy.resolve(fingerprint),
+        "compatible": compatible,
+        "status": "compatible" if compatible else "incompatible",
+        "active_dimension": fingerprint.dimension,
+        "stored_dimension": stored_dimension,
+        "fingerprint": fingerprint.short_id,
+    }
 
 
 __all__ = [
-    "AgentExecutionError",
-    "ConfigurationError",
-    "DocumentLoadError",
-    "IngestError",
-    "ModelInvocationError",
-    "ModelNotConfiguredError",
-    "PermissionDeniedError",
-    "RAGError",
-    "ResourceNotFoundError",
-    "RetrievalError",
-    "ToolExecutionError",
-    "ValidationError",
+    "CollectionCompatibilityError",
+    "CollectionPolicy",
+    "EmbeddingFingerprint",
+    "create_collection_policy",
+    "describe_compatibility",
+    "fingerprint_embedder",
+    "validate_compatibility",
 ]
