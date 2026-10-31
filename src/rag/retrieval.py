@@ -7,14 +7,14 @@ from contextlib import nullcontext
 
 from pydantic import BaseModel
 
-from exceptions import RetrievalError
+from exceptions import RetrievalError, ValidationError
 from model.embedding import EmbeddingModel
 from observability import get_logger, get_metric
 from rag.reranker import Reranker, create_reranker
 from rag.types import RetrievedContext, RetrievedDocument
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
-    from rag.vector_store import VectorStore
+    from rag.vector_store import VectorRecord, VectorStore
     from settings import RetrievalSettings
 
 logger = get_logger(__name__)
@@ -57,12 +57,19 @@ class RetrievalPipeline:
         top_k: int | None = None,
         allowed_sources: typing.Sequence[str] | None = None,
         owner_id: str | None = None,
+        search_type: str = "vector",
     ) -> RetrievedContext:
-        """返回授权且重排后的检索证据。"""
-        if not query.strip():
-            raise ValueError("检索查询不能为空。")
+        """返回授权且重排后的检索证据。
 
-        limit = max(1, top_k or self._settings.top_k)
+        search_type 由上层声明（如 hybrid 层传 "hybrid"）；默认 "vector"，
+        保持本类对调用方无感知。
+        """
+        query = query.strip()
+        if not query:
+            raise ValidationError("检索查询不能为空。")
+
+        # top_k 显式 None 用默认；<=0 也回退到默认，避免下游 0 或负数导致空结果。
+        limit = top_k if top_k is not None and top_k > 0 else self._settings.top_k
         fetch_k = limit * max(1, self._settings.fetch_multiplier)
         query_embedding = self._embedder.embed_query(query)
 
@@ -87,20 +94,31 @@ class RetrievalPipeline:
 
         retrieval_documents = get_metric("retrieval_documents")
         if retrieval_documents is not None:
-            retrieval_documents.labels(tenant_id=tenant_id).observe(len(evidence))
+            # 去掉 tenant_id label：租户数高时会造成 Prometheus series 爆炸。
+            # 租户维度应放在 trace/log，而非 metric。
+            retrieval_documents.observe(len(evidence))
 
         if not evidence:
-            logger.info(f"检索为空 | query_len={len(query)} | tenant_id={tenant_id}")
-            return RetrievedContext(query=query, documents=[], search_type="vector")
+            logger.info(
+                "检索为空 | query_len=%d | tenant_id=%s", len(query), tenant_id
+            )
+            return RetrievedContext(
+                query=query, documents=[], search_type=search_type
+            )
 
         if self._settings.rerank.enabled:
             evidence = self._apply_reranking(query, evidence)
 
         documents = self._to_context_documents(evidence[:limit])
-        context = RetrievedContext(query=query, documents=documents, search_type="vector")
+        context = RetrievedContext(
+            query=query, documents=documents, search_type=search_type
+        )
         logger.info(
-            f"检索完成 | tenant_id={tenant_id} | candidates={fetch_k} | "
-            f"retrieved={len(documents)} | reranked={self._settings.rerank.enabled}"
+            "检索完成 | tenant_id=%s | candidates=%d | retrieved=%d | reranked=%s",
+            tenant_id,
+            fetch_k,
+            len(documents),
+            self._settings.rerank.enabled,
         )
         return context
 
@@ -120,22 +138,32 @@ class RetrievalPipeline:
 
         for result in results:
             entry = evidence_map.get(result.document.chunk_id)
-            if entry:
-                reranked.append(
-                    RetrievedEvidence(
-                        document=entry.document,
-                        vector_score=entry.vector_score,
-                        rerank_score=result.score,
-                    )
+            if entry is None:
+                # reranker 返回了证据集中不存在的 chunk_id，可能是模型幻觉或
+                # ID 映射错误；记录 warning 而不是静默丢弃。
+                logger.warning(
+                    "reranker 返回未知 chunk_id | chunk_id=%s",
+                    result.document.chunk_id,
                 )
+                continue
+            # 仅采用 rerank 分数；document 以原始检索结果为准（reranker 可能
+            # 返回 enrich 过的 document，但这里不采用其元数据变更）。
+            reranked.append(
+                RetrievedEvidence(
+                    document=entry.document,
+                    vector_score=entry.vector_score,
+                    rerank_score=result.score,
+                )
+            )
 
+        # 保守排序：有 rerank_score 的按 rerank_score 降序排在前；
+        # 没有 rerank_score 的按 vector_score 降序排在后。
+        # 不混合两种量纲的分数直接比较。
         reranked.sort(
             key=lambda item: (
-                item.rerank_score
-                if item.rerank_score is not None
-                else item.vector_score
-            ),
-            reverse=True,
+                item.rerank_score is None,
+                -(item.rerank_score or 0.0),
+            )
         )
         return reranked
 
@@ -151,7 +179,7 @@ class RetrievalPipeline:
         return documents
 
     @staticmethod
-    def _is_authorized(record: typing.Any, owner_id: str | None) -> bool:
+    def _is_authorized(record: "VectorRecord", owner_id: str | None) -> bool:
         """判断文档是否对当前主体可见。
 
         一旦指定 owner_id，只返回 owner_id 严格匹配的文档；
@@ -162,14 +190,17 @@ class RetrievalPipeline:
         return getattr(record, "owner_id", None) == owner_id
 
     @staticmethod
-    def _to_document(record: typing.Any, score: float) -> RetrievedDocument:
+    def _to_document(record: "VectorRecord", score: float) -> RetrievedDocument:
+        # record.text 在部分 vector store 实现中可能为 None（只存向量不存原文），
+        # 此时用空串兜底，避免 RetrievedDocument.content（str）校验失败。
         return RetrievedDocument(
             document_id=record.document_id,
             chunk_id=record.chunk_id,
             title=record.title,
             source=record.source,
-            content=record.text,
+            content=record.text or "",
             score=score,
+            page=record.page,
             tenant_id=record.tenant_id,
             owner_id=record.owner_id,
             tags=list(record.tags or []),
