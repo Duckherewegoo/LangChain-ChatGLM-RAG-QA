@@ -24,7 +24,6 @@ from model.errors import (
     ModelPayloadError,
     ModelRateLimitError,
     ModelTimeoutError,
-    is_retryable,
 )
 from model.protocol import ChatModel, ChatRequest, ChatResponse
 from observability import get_logger
@@ -48,10 +47,9 @@ class _OpenAICompatibleChatModel:
         self.model_name = settings.model_name
         self._assert_configured()
 
-        # 同步客户端实例化
         self._client = httpx.Client(timeout=settings.timeout_seconds)
-        # 异步客户端也实例化在这里，避免每次请求重新建连
-        self._async_client = httpx.AsyncClient(timeout=settings.timeout_seconds)
+        # 异步客户端按需创建：仅用同步路径时不持有连接池
+        self._async_client: httpx.AsyncClient | None = None
         self._bound_tools: list[dict[str, typing.Any]] | None = None
 
     def _assert_configured(self) -> None:
@@ -84,7 +82,7 @@ class _OpenAICompatibleChatModel:
         tool_choice: str | dict[str, typing.Any] | None = None,
     ) -> dict[str, typing.Any]:
 
-        # 修复：手动转换消息格式，不再依赖未实现的 ChatRequest 方法
+        # 手动转换消息格式；ChatRequest.to_langchain_messages 留给 LangChain 路径。
         openai_messages = []
         for msg in request.messages:
             role = msg.get("role", "user")
@@ -114,52 +112,14 @@ class _OpenAICompatibleChatModel:
         return self
 
     def invoke(self, request: ChatRequest) -> ChatResponse:
-        return self._request_with_retry(request)
+        return self._post(request)
 
     async def ainvoke(self, request: ChatRequest) -> ChatResponse:
-        return await self._arequest_with_retry(request)
-
-    def _request_with_retry(self, request: ChatRequest) -> ChatResponse:
-        attempts = 0
-        maximum = max(1, self._settings.max_retries + 1)
-        while True:
-            attempts += 1
-            try:
-                return self._post(request)
-            except Exception as exc:
-                if attempts >= maximum or not is_retryable(exc, provider=self._settings.provider):
-                    raise
-                delay = min(2 ** (attempts - 1), 8)
-                # 修复：改为标准的 logging 格式化
-                logger.warning(
-                    f"模型重试已调度 | provider={self._settings.provider} | "
-                    f"attempt={attempts} | delay={delay}s | error={exc!s}"
-                )
-                time.sleep(delay)
-
-    async def _arequest_with_retry(self, request: ChatRequest) -> ChatResponse:
-        attempts = 0
-        maximum = max(1, self._settings.max_retries + 1)
-        while True:
-            attempts += 1
-            try:
-                return await self._apost(request)
-            except Exception as exc:
-                if attempts >= maximum or not is_retryable(exc, provider=self._settings.provider):
-                    raise
-                delay = min(2 ** (attempts - 1), 8)
-                logger.warning(
-                    f"模型重试已调度(异步) | provider={self._settings.provider} | "
-                    f"attempt={attempts} | delay={delay}s | error={exc!s}"
-                )
-                await _async_sleep(delay)
+        return await self._apost(request)
 
     def _post(self, request: ChatRequest) -> ChatResponse:
-        payload = self._payload(
-            request,
-            tools=self._bound_tools,
-            tool_choice="auto" if self._bound_tools else None,
-        )
+        tools = list(request.tools) or self._bound_tools
+        payload = self._payload(request, tools=tools, tool_choice="auto" if tools else None)
         started = time.perf_counter()
         try:
             response = self._client.post(
@@ -181,11 +141,10 @@ class _OpenAICompatibleChatModel:
         return self._parse_response(response, latency=time.perf_counter() - started)
 
     async def _apost(self, request: ChatRequest) -> ChatResponse:
-        payload = self._payload(
-            request,
-            tools=self._bound_tools,
-            tool_choice="auto" if self._bound_tools else None,
-        )
+        tools = list(request.tools) or self._bound_tools
+        payload = self._payload(request, tools=tools, tool_choice="auto" if tools else None)
+        if self._async_client is None:
+            self._async_client = httpx.AsyncClient(timeout=self._settings.timeout_seconds)
         started = time.perf_counter()
         try:
             response = await self._async_client.post(
@@ -217,7 +176,7 @@ class _OpenAICompatibleChatModel:
                 f"模型请求被限流 (429): {response.text[:300]}",
                 details={"provider": self._settings.provider, "status_code": response.status_code},
             )
-        if response.status_code in {400, 200} and "content policy" in response.text.lower():
+        if response.status_code == 400 and "content policy" in response.text.lower():
             raise ModelContentPolicyError(
                 f"模型响应被内容策略阻断: {response.text[:300]}",
                 details={"provider": self._settings.provider},
@@ -248,6 +207,13 @@ class _OpenAICompatibleChatModel:
             for call in (message.get("tool_calls") or [])
             if (call.get("function") or {}).get("name")
         ]
+
+        if not content and not tool_calls:
+            raise ModelPayloadError(
+                "模型返回空内容且无工具调用。",
+                details={"provider": self._settings.provider},
+            )
+
         usage = data.get("usage") or {}
         return ChatResponse(
             content=content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
@@ -269,10 +235,14 @@ class _OpenAICompatibleChatModel:
 
     async def aclose(self) -> None:
         """关闭异步客户端。"""
+        if self._async_client is None:
+            return
         try:
             await self._async_client.aclose()
         except Exception as exc:
             logger.debug(f"http_async_client_close_failed | error={exc!s}")
+        finally:
+            self._async_client = None
 
     def __enter__(self) -> _OpenAICompatibleChatModel:
         return self
@@ -305,14 +275,6 @@ def _coerce_int(value: typing.Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-async def _async_sleep(seconds: float) -> None:
-    try:
-        import asyncio
-        await asyncio.sleep(seconds)
-    except RuntimeError:
-        time.sleep(seconds)
 
 
 __all__ = ["OpenAICompatibleChatModel"]
