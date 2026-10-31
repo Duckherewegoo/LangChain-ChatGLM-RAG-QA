@@ -10,13 +10,13 @@ JSON 响应。它必须绝不让原始堆栈或密钥材料流向客户端。对
 
 from __future__ import annotations
 
-import re
 import typing
 
 from pydantic import BaseModel, Field
 
 from base.exceptions import RAGError
 from base.observability import get_logger
+from base.redaction import redact_details
 
 logger = get_logger(__name__)
 
@@ -39,7 +39,7 @@ def map_exception(exc: BaseException, *, request_id: str | None = None) -> tuple
         return exc.status_code, ErrorEnvelope(
             error=exc.error_code,
             message=exc.message,
-            details=_safe_details(exc.details),
+            details=redact_details(exc.details),
             request_id=request_id,
         )
 
@@ -94,43 +94,6 @@ def map_exception(exc: BaseException, *, request_id: str | None = None) -> tuple
         message=_SAFE_INTERNAL_MESSAGE,
         request_id=request_id,
     )
-
-
-# 子串匹配敏感键名；误伤 max_tokens / token_count 等字段可接受。
-_SENSITIVE_HINTS = (
-    "api_key", "apikey", "api-key", "token",
-    "secret", "password", "passwd", "authorization",
-    "credential", "bearer",
-)
-
-# 匹配常见的密钥格式（如 sk-...）
-_SECRET_VALUE_PATTERN = re.compile(
-    r"(sk-[A-Za-z0-9]{8,}|Bearer\s+[A-Za-z0-9._\-]{8,})"
-)
-
-
-def _safe_details(details: typing.Any) -> dict[str, typing.Any]:
-    """递归脱敏错误详情。
-
-    键名含敏感关键词即替换为 [redacted]；字符串值按密钥格式替换；
-    dict / list 递归处理。非 dict 输入返回空 dict。
-    """
-    if not isinstance(details, dict):
-        return {}
-    return {key: _redact_value(key, value) for key, value in details.items()}
-
-
-def _redact_value(key: str, value: typing.Any) -> typing.Any:
-    """按敏感键名与密钥格式脱敏单个值。"""
-    if isinstance(key, str) and any(hint in key.lower() for hint in _SENSITIVE_HINTS):
-        return "[redacted]"
-    if isinstance(value, dict):
-        return _safe_details(value)
-    if isinstance(value, list):
-        return [_redact_value(key, item) for item in value]
-    if isinstance(value, str):
-        return _SECRET_VALUE_PATTERN.sub("[REDACTED]", value)
-    return value
 
 
 __all__ = ["ErrorEnvelope", "map_exception"]

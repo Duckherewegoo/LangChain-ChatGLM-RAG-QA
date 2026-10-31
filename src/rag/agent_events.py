@@ -15,6 +15,7 @@ import uuid
 from pydantic import BaseModel, Field, model_serializer
 
 from base.observability import get_logger
+from base.redaction import redact_details
 
 logger = get_logger(__name__)
 
@@ -70,7 +71,7 @@ class AgentEvent(BaseModel):
     def _serialize(self, handler: typing.Any) -> dict[str, typing.Any]:
         """序列化时统一脱敏 data，保证 model_dump 与 to_jsonl 路径一致。"""
         payload = handler(self)
-        payload["data"] = _redact(dict(payload.get("data") or {}))
+        payload["data"] = redact_details(dict(payload.get("data") or {}))
         return payload
 
     def for_audit(self) -> dict[str, typing.Any]:
@@ -184,36 +185,6 @@ class LoggingAgentEventListener(AgentEventListener):
         extra_info = event.for_audit()
         self._logger.info(
             f"agent_event | type={event.event_type} | node={event.node or 'N/A'}", agent_event=extra_info)
-
-
-_SENSITIVE_HINTS = (
-    "api_key",
-    "apikey",
-    "token",
-    "secret",
-    "password",
-    "authorization",
-    "credential",
-    "bearer",
-)
-
-
-def _redact(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
-    """递归脱敏；键名包含敏感关键词即替换为 [redacted]。
-
-    只处理 dict 的键名；list 中的裸字符串（如 headers 里的 "Authorization: Bearer x"）不在覆盖范围。
-    """
-    cleaned: dict[str, typing.Any] = {}
-    for key, value in payload.items():
-        if isinstance(key, str) and any(hint in key.lower() for hint in _SENSITIVE_HINTS):
-            cleaned[key] = "[redacted]"
-        elif isinstance(value, dict):
-            cleaned[key] = _redact(value)
-        elif isinstance(value, list):
-            cleaned[key] = [_redact(item) if isinstance(item, dict) else item for item in value]
-        else:
-            cleaned[key] = value
-    return cleaned
 
 
 def _collect_unique(events: typing.Iterable[AgentEvent], attribute: str) -> list[str]:
