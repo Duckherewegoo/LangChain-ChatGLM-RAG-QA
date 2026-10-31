@@ -106,6 +106,19 @@ class ToolExecutionError(RAGError):
     status_code = 500
     error_code = "tool_execution_error"
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        tool: str | None = None,
+        retryable: bool = False,
+        details: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        super().__init__(message, details=details, trace_id=trace_id)
+        self.tool = tool
+        self.retryable = retryable
+
 
 class PermissionDeniedError(RAGError):
     """用户或租户无权访问请求的资源。"""
