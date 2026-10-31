@@ -1,6 +1,6 @@
 [project]
 name = "langchain-chatglm-rag-qa"
-version = "0.2.0"
+version = "0.3.0"
 description = "Configurable enterprise retrieval-augmented generation assistant with LangChain, LangGraph, and a pluggable ChatGLM model adapter."
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
@@ -12,11 +12,7 @@ dependencies = [
     # ── 核心框架与模型层 ──
     "langchain>=0.3,<2.0",
     "langchain-core>=0.3,<2.0",
-    "langchain-openai>=0.2,<2.0",
-    "langchain-text-splitters>=0.3,<2.0",
-    "langchain-community>=0.3,<1.0",
     "langgraph>=0.2,<2.0",
-    "openai>=1.0,<2.0",
     "httpx>=0.27,<1.0",
 
     # ── Web 服务 ──
@@ -28,6 +24,7 @@ dependencies = [
     "pydantic>=2.7,<3.0",
     "pydantic-settings>=2.4,<3.0",
     "pyyaml>=6.0,<7.0",
+    "python-dotenv>=1.0,<2.0",
 
     # ── 向量检索与重排 ──
     "chromadb>=0.5,<2.0",
@@ -41,10 +38,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 如果使用 MCP 工具源，需要安装此依赖
-mcp = [
-    "mcp>=1.0,<2.0",
-]
+mcp = ["mcp>=1.0,<2.0"]
+
+[project.scripts]
+enterprise-rag = "base.main:main"
 
 [project.urls]
 Homepage = "https://github.com/Duckherewegoo/LangChain-ChatGLM-RAG-QA"
@@ -65,7 +62,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 sources = ["src"]
-packages = ["api", "rag", "model", "data_process", "settings", "main.py", "observability.py", "exceptions.py"]
+packages = ["api", "rag", "model", "data_process", "settings", "base"]
 
 # ==========================================
 # 工具链配置
@@ -127,3 +124,11 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 pythonpath = ["src"]
+
+[tool.pyright]
+include = ["src", "tests"]
+extraPaths = ["src"]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+reportMissingImports = true
+reportMissingTypeStubs = false

@@ -13,23 +13,21 @@ from collections.abc import Sequence
 
 import pytest
 
-# 保证项目根在 sys.path 上，避免 tests 被当作独立包之外的模块。
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from model.protocol import ChatModel, ChatRequest, ChatResponse  # noqa: E402
-from model.registry import clear_registry, register_provider  # noqa: E402
-from model.router import ModelRouter  # noqa: E402,F401  # 保留以兼容旧导入
-from model.routing_types import (  # noqa: E402
+from model.protocol import ChatModel, ChatRequest, ChatResponse  
+from model.registry import clear_registry, register_provider  
+from model.router import ModelRouter  
+from model.routing_types import (  
     ModelRouterSettings,
     ModelRoutingEntry,
     UseCaseBinding,
 )
-from rag.agent import AgentRequest  # noqa: E402,F401
-from rag.retrieval import RetrievalPipeline  # noqa: E402
-from rag.service import AnswerRequest, RAGService  # noqa: E402,F401
-from rag.tools import Guardrails, ToolRegistry, create_rag_tool_registry  # noqa: E402
-from rag.vector_store import SearchResult, VectorRecord  # noqa: E402
-from settings import (  # noqa: E402
+from rag.agent import AgentRequest  
+from rag.retrieval import RetrievalPipeline  
+from rag.service import AnswerRequest, RAGService  
+from rag.tools import Guardrails, ToolRegistry, create_rag_tool_registry  
+from rag.vector_store import SearchResult, VectorRecord  
+from settings import (  
     AgentSettings,
     AppSettings,
     GuardrailsSettings,
