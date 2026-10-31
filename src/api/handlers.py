@@ -185,12 +185,34 @@ def _safe_document(item: dict[str, typing.Any]) -> RetrievedDocumentView:
 
 
 def _build_health(container: Container, *, liveness: bool) -> HealthResponseBody:
-    """构建 liveness / readiness 健康检查响应（不发起模型调用）。"""
+    """构建 liveness / readiness 健康检查响应。
+
+    liveness=True：只返回进程与配置信息，不触碰向量库或 embedder。
+    K8s 存活探针不应依赖外部组件——向量库抖动会导致 Pod 重启循环。
+
+    liveness=False：读取向量库与 embedder，检查维度兼容性。失败仅影响
+    readiness，不影响存活。
+    """
     settings = container.settings
+
+    if liveness:
+        return HealthResponseBody(
+            status="ok",
+            app_env=settings.app_env,
+            api_configured=settings.model_chat.is_configured,
+            vector_store=settings.retrieval.vector_store.type,
+            collection="n/a",
+            embedding_model=settings.model_embedding.model_name,
+            embedding_dimension=0,
+            collection_compatible=True,
+            primary_model=None,
+            available_models=[],
+            degraded=False,
+        )
+
     store = container.vector_store()
     fingerprint = container.embedding_fingerprint()
-
-    stored_dim, collection_compatible = _collection_status(container)
+    _, collection_compatible = _collection_status(container)
     primary_name, _ = _primary_route(container.model_router())
 
     return HealthResponseBody(
