@@ -15,7 +15,7 @@ from api.handlers import (
     _build_health,
     _build_model_health,
     _ensure_vector_store,
-    _run_agent,
+    _run_via_orchestrator,
     _sse,
     _to_answer_request,
 )
@@ -205,7 +205,7 @@ def create_app(container: Container | None = None) -> FastAPI:
             additional_context=body.additional_context,
             use_case=body.use_case,
         )
-        response = await _run_agent(
+        response = await _run_via_orchestrator(
             dependencies, runtime_request, body.additional_context
         )
 
