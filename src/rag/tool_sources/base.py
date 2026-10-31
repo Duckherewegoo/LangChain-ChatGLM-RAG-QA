@@ -5,19 +5,8 @@ from __future__ import annotations
 import typing
 from abc import ABC, abstractmethod
 
+from base.exceptions import ToolExecutionError
 from rag.tool_types import ToolContext, ToolSpec
-
-
-class ToolExecutionError(RuntimeError):
-    """当工具调用在来源边界失败时抛出。
-
-    这是注册表承诺传播的唯一异常类型。
-    """
-
-    def __init__(self, message: str, *, tool: str | None = None, retryable: bool = False) -> None:
-        super().__init__(message)
-        self.tool = tool
-        self.retryable = retryable
 
 
 class ToolSource(ABC):
