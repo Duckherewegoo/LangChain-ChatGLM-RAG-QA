@@ -106,6 +106,8 @@ class ModelRouterSettings(BaseModel):
             raise ValueError(
                 f"默认用例 {self.default_use_case!r} 未在 use_cases 中找到绑定。"
             )
+        if self.models and not self.use_cases:
+            raise ValueError("已配置 models 但未配置 use_cases，模型将无法被路由。")
         return self
 
 

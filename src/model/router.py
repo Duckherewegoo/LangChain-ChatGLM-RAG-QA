@@ -72,14 +72,15 @@ class ModelRouter:
 
     def get_model(self, name: str) -> "ChatModel":
         """按配置的名称返回缓存的模型实例。"""
-        # 快速路径：无锁读取缓存
-        if name in self._cache:
-            return self._cache[name]
+        # 快速路径：dict.get 原子读取，避免 clear_cache 的 KeyError 竞态
+        cached = self._cache.get(name)
+        if cached is not None:
+            return cached
 
         with self._cache_lock:
-            # 双重检查锁：防止在等待锁的过程中其他线程已经实例化完毕
-            if name in self._cache:
-                return self._cache[name]
+            cached = self._cache.get(name)
+            if cached is not None:
+                return cached
 
             entry = self._configuration.models.get(name)
             if entry is None:
@@ -97,7 +98,6 @@ class ModelRouter:
             model = create_chat_model(entry.to_provider_settings())
             self._cache[name] = model
             return model
-
     def route(self, use_case: str | None = None) -> ModelRoute:
         """为业务用例解析模型链。"""
         target_use_case = use_case or self._configuration.default_use_case
