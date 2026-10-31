@@ -7,12 +7,15 @@ from typing import TYPE_CHECKING, Iterable
 
 from exceptions import DocumentLoadError, IngestError
 from observability import get_logger
+from rag.types import RetrievedDocument
+
 from .chunker import DocumentChunker, compute_document_id, normalize_whitespace
 from .loaders import DocumentLoader
 from .types import IngestStatistics
 
 if TYPE_CHECKING:  # 仅用于类型检查，避免运行时循环 import
     from model import EmbeddingModel
+    from rag.strategies.retrievers import BM25Index
     from rag.vector_store import VectorStore
 
 logger = get_logger(__name__)
@@ -29,10 +32,15 @@ class IngestPipeline:
         loader: DocumentLoader,
         chunker: DocumentChunker,
         vector_store: "VectorStore",
+        *,
+        # 可选：不注入时关键词检索分支永远返回空（P0-5 未修复状态）。
+        # 注入后 ingest / remove 会同步维护 keyword 索引。
+        keyword_index: "BM25Index | None" = None,
     ) -> None:
         self._loader = loader
         self._chunker = chunker
         self._vector_store = vector_store
+        self._keyword_index = keyword_index
 
     def ingest_path(
         self,
@@ -52,11 +60,13 @@ class IngestPipeline:
         安全说明：path 未做白名单校验，调用方需保证传入可信路径。
 
         幂等性说明：同一 path 重复摄入时，是否覆盖取决于 vector_store.add
-        的语义（upsert 或新增）；本管道自身不做"先删后写"。
+        的语义（upsert 或新增）；本管道自身不做"先删后写"。keyword_index
+        侧按 chunk_id 幂等去重，重复 ingest 不会重复累加。
 
-        已知问题（P0-5）：构造时未注入 keyword_index，混合检索的 keyword
-        分支永远返回空。修复需 container 层把 _keyword_index 注入本类，
-        并在 chunk 成功后写入——属跨文件改动。
+        关键词索引一致性（P0-5）：若构造时注入了 keyword_index，向量写入
+        成功后会同步写入关键词索引。若关键词写入失败，向量侧数据已落库，
+        但 keyword 索引缺失该文档——会在 errors 中记录 stage="keyword"，
+        需通过重新 ingest 或对账任务修复。这是「尽力一致」而非事务一致。
 
         已知问题（B6）：errors 在本函数内累积，但 API 层
         （api/schemas.IngestResponseBody）未暴露该字段，用户看不到失败详情。
@@ -146,6 +156,16 @@ class IngestPipeline:
                 "文档摄入成功 | path=%s | chunks=%d", file_path, len(chunks)
             )
 
+            # 关键词索引同步写入。失败不视为整批失败：向量侧已落库，调用方
+            # 通过 errors[stage="keyword"] 感知不一致，由对账/重新 ingest 修复。
+            if self._keyword_index is not None:
+                try:
+                    self._keyword_index.add(self._to_keyword_documents(records))
+                except Exception as exc:
+                    self._record_error(
+                        errors, file_path, "keyword", exc, "关键词索引写入失败"
+                    )
+
         return IngestStatistics(
             document_id=result_document_id,
             source=str(path),
@@ -160,8 +180,64 @@ class IngestPipeline:
         )
 
     def remove_document(self, document_id: str, tenant_id: str = "default") -> int:
-        """删除某个文档的所有 chunk。"""
-        return self._vector_store.delete_by_document(document_id, tenant_id)
+        """删除某个文档的所有 chunk。
+
+        返回值语义：向量库中删除的 chunk 数（与既有一致，API 层 /v1/documents
+        依赖此数）。keyword 索引的删除数不在此返回值内体现，仅打日志。
+
+        一致性：若 keyword_index 删除失败（或 keyword 索引未注入），可能
+        出现"向量已删、关键词仍能命中"的残留。tenant / source 过滤仍能
+        阻止跨租户泄露，但同一租户下会看到已删除文档。可在重启（内存索引
+        重建）或重新 ingest 时收敛。
+        """
+        removed = self._vector_store.delete_by_document(document_id, tenant_id)
+        if self._keyword_index is not None:
+            try:
+                kw_removed = self._keyword_index.remove_by_document(
+                    document_id, tenant_id
+                )
+                if kw_removed != removed:
+                    logger.warning(
+                        "向量与关键词删除数量不一致 | document_id=%s | "
+                        "vector_removed=%d | keyword_removed=%d",
+                        document_id,
+                        removed,
+                        kw_removed,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "关键词索引删除失败，可能存在残留 | document_id=%s | error=%s",
+                    document_id,
+                    exc,
+                )
+        return removed
+
+    @staticmethod
+    def _to_keyword_documents(
+        records: Iterable["object"],
+    ) -> list[RetrievedDocument]:
+        """把 VectorRecord 列表转换为 RetrievedDocument 列表，供 BM25 索引使用。
+
+        字段映射：VectorRecord.text → RetrievedDocument.content；
+        其余同名字段直接透传。score 置 0（关键词索引不使用向量分数）。
+        """
+        documents: list[RetrievedDocument] = []
+        for record in records:
+            documents.append(
+                RetrievedDocument(
+                    document_id=record.document_id,
+                    chunk_id=record.chunk_id,
+                    title=record.title,
+                    source=record.source,
+                    content=record.text or "",
+                    page=record.page,
+                    tenant_id=record.tenant_id,
+                    owner_id=record.owner_id,
+                    tags=list(record.tags or []),
+                    metadata=dict(record.metadata or {}),
+                )
+            )
+        return documents
 
     @staticmethod
     def _record_error(
