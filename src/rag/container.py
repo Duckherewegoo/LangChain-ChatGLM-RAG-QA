@@ -407,15 +407,15 @@ class Container:
 
     def _build_executor(self) -> FallbackExecutor:
         route = self.model_router().route("chat")
-        # max_retries 语义是"重试次数"（不含首次），因此总尝试次数 = max_retries + 1。
-        # 注意（P1-4）：FallbackExecutor.max_attempts_per_provider 的确切语义
-        # （"每 provider 总尝试"还是"合计"）需以 FallbackExecutor 实现为准；
-        # 若为"每 provider"，多 provider 下总调用 = max_attempts × provider 数。
+        # max_retries 是"每个 provider 的重试次数"（不含首次），
+        # 因此每 provider 尝试次数 = max_retries + 1；
+        # 整条链的总预算由 model_chat.max_total_attempts 单独控制，未设则不限。
         max_attempts = max(1, self._settings.model_chat.max_retries + 1)
         return FallbackExecutor(
             primary=route.primary,
             secondaries=[model for _, model in route.secondaries],
             max_attempts_per_provider=max_attempts,
+            max_total_attempts=self._settings.model_chat.max_total_attempts,
         )
 
     def _primary_model(self) -> ChatModel:

@@ -22,7 +22,6 @@ from observability import get_logger
 
 logger = get_logger(__name__)
 
-
 class ModelChatSettings(BaseModel):
     """单个 LLM 端点的配置。"""
 
@@ -35,6 +34,8 @@ class ModelChatSettings(BaseModel):
     timeout_seconds: float = Field(default=30.0, gt=0)
     # 保留字段：默认保守重试策略，未来接入重试逻辑时使用
     max_retries: int = Field(default=2, ge=0)
+    # 整条回退链的总尝试次数上限；None 表示只受 max_attempts_per_provider 约束。
+    max_total_attempts: int | None = Field(default=None, ge=1)
 
     @property
     def is_configured(self) -> bool:
