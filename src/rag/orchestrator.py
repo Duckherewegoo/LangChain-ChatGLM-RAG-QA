@@ -216,6 +216,8 @@ class AgentOrchestrator:
         trail: AgentAuditTrail,
     ) -> None:
         role = self._roles["retriever"]
+        if not role.can_handle(blackboard):
+            return
         blackboard.roles_invoked.append(role.definition.name)
         trail.record_now(
             event_type=AgentEventType.ROLE_DISPATCHED,
@@ -246,7 +248,6 @@ class AgentOrchestrator:
             self._document_to_evidence(document)
             for document in retrieval_result.documents
         ]
-        blackboard.rewritten_queries = [blackboard.original_question]
         trail.record_now(
             event_type=AgentEventType.RETRIEVAL,
             node="retriever",
