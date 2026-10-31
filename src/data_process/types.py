@@ -53,6 +53,8 @@ class IngestStatistics(BaseModel):
     chunks_created: int
     chunks_stored: int
     bytes_size: int
+    # 预留字段：当前 pipeline 不设置 skipped / reason。
+    # 如需区分"整批全跳过"，可从 errors + chunks_created 推断。
     skipped: bool = False
     reason: str | None = None
     errors: list[dict[str, str]] = Field(default_factory=list)

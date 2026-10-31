@@ -206,10 +206,11 @@ def normalize_whitespace(text: str) -> str:
 
 
 def compute_document_id(source: str, content: str | None = None) -> str:
-    """基于路径与内容生成稳定的文档标识。
+    """基于路径（可选再基于内容）生成稳定的文档标识。
 
-    无论是否有 content，同一文件在同一路径下必须生成同一个 document_id，
-    否则 delete_by_document 会失效。
+    无 content 时基于 abspath 生成；有 content 时在 abspath 基础上追加内容。
+    对同一份文档，调用方必须始终传 content 或始终不传，混用会导致 ID 不一致。
+    摄入管线统一传 normalize_whitespace(text)，删除时也据此匹配。
     """
     digest = hashlib.sha256()
     digest.update(os.path.abspath(source).encode("utf-8"))
@@ -217,6 +218,5 @@ def compute_document_id(source: str, content: str | None = None) -> str:
         digest.update(b"\x00")
         digest.update(content.encode("utf-8"))
     return digest.hexdigest()[:24]
-
 
 __all__ = ["DocumentChunker", "compute_document_id", "normalize_whitespace"]

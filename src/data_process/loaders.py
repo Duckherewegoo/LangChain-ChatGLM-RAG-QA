@@ -1,4 +1,8 @@
-"""多格式文档加载器。"""
+"""多格式文档加载器。
+
+安全说明：scan / load 不限制 root 范围，/v1/ingest 的 body.path 由客户端控制，
+暴露到公网前必须加白名单校验（或在部署层限制入口）。
+"""
 
 from __future__ import annotations
 
@@ -24,10 +28,15 @@ class DocumentLoader:
     def allowed_extensions(self) -> list[str]:
         return list(self._extensions)
 
-    def scan(self, root: str | os.PathLike[str], pattern: str = "**/*") -> list[str]:
+    def scan(
+        self,
+        root: str | os.PathLike[str],
+        pattern: str = "**/*",
+    ) -> list[str]:
         """在 root 下发现匹配扩展名的文件。
 
         深度限制通过清空 dirs 实现真正阻断，而非 continue 跳过。
+        pattern 为预留参数，当前按扩展名过滤，不使用 pattern。
         """
         base = os.path.abspath(root)
         if not os.path.exists(base):
@@ -84,12 +93,25 @@ def _load_text(path: str) -> tuple[str, dict[str, typing.Any]]:
                 return stream.read(), {}
         except UnicodeDecodeError:
             continue
+        except OSError as exc:
+            raise DocumentLoadError(
+                f"文件读取失败: {exc}", details={"path": path}
+            ) from exc
     raise DocumentLoadError("无法用 utf-8/gb18030/gbk 解码文件。", details={"path": path})
 
 
 def _load_json(path: str) -> tuple[str, dict[str, typing.Any]]:
-    with open(path, encoding="utf-8") as stream:
-        data = json.load(stream)
+    try:
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except json.JSONDecodeError as exc:
+        raise DocumentLoadError(
+            f"JSON 解析失败: {exc}", details={"path": path}
+        ) from exc
+    except OSError as exc:
+        raise DocumentLoadError(
+            f"文件读取失败: {exc}", details={"path": path}
+        ) from exc
     if isinstance(data, dict):
         text = data.get("content") or data.get("text")
         extra = {k: v for k, v in data.items() if k not in {"content", "text"}}
@@ -102,6 +124,36 @@ def _load_json(path: str) -> tuple[str, dict[str, typing.Any]]:
             for item in data
         ), {}
     return json.dumps(data, ensure_ascii=False), {}
+
+
+def _load_jsonl(path: str) -> tuple[str, dict[str, typing.Any]]:
+    """逐行解析 JSONL，每行必须是一个独立 JSON 值。"""
+    items: list[str] = []
+    try:
+        with open(path, encoding="utf-8") as stream:
+            for lineno, line in enumerate(stream, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise DocumentLoadError(
+                        f"JSONL 第 {lineno} 行解析失败: {exc}",
+                        details={"path": path, "line": lineno},
+                    ) from exc
+                items.append(
+                    json.dumps(value, ensure_ascii=False)
+                    if isinstance(value, (dict, list))
+                    else str(value)
+                )
+    except OSError as exc:
+        raise DocumentLoadError(
+            f"文件读取失败: {exc}", details={"path": path}
+        ) from exc
+    if not items:
+        raise DocumentLoadError("JSONL 文件为空。", details={"path": path})
+    return "\n".join(items), {"lines": len(items)}
 
 
 def _load_markdown(path: str) -> tuple[str, dict[str, typing.Any]]:
@@ -141,7 +193,7 @@ _LOADERS: dict[str, typing.Callable[[str], tuple[str, dict[str, typing.Any]]]] =
     "md": _load_markdown,
     "markdown": _load_markdown,
     "json": _load_json,
-    "jsonl": _load_json,
+    "jsonl": _load_jsonl,
     "pdf": _load_pdf,
     "docx": _load_docx,
 }
