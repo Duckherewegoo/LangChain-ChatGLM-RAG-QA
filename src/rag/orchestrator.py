@@ -1,10 +1,19 @@
 """多角色协作编排器（Multi-Agent Orchestrator）。
 
-本项目由多个职责单一的角色协作完成企业知识库问答。
-本模块把这些角色编排成一张可观测的流水线：
-    retrieve -> reason -> review -> finalize
-                            |
-                            +--（审核不通过，retryable）--> reason
+职责边界：
+    - 编排：retrieve -> reason -> review 循环 -> finalize
+    - 审计：每一步写入 AgentAuditTrail
+    - 组装：把内部 Blackboard 映射为对外 OrchestratorResponse
+    检索实现、Prompt 细节、审核策略、模型选择、工具调用均不在此模块。
+
+审核循环语义：
+    AgentSettings.review.max_retries = N 表示「最多重试 N 次」，
+    因此审核最多执行 N + 1 轮（首次审核 + N 次带反馈重试）。
+    reasoner 主动拒答（无可用证据）时只审核一次，不再重试。
+
+失败策略（故意不对称）：
+    - 检索失败：软失败，记录错误后继续，交由 reasoner 走 can_handle=False；
+    - 推理失败：硬失败，抛 AgentExecutionError 中断流水线。
 """
 
 from __future__ import annotations
@@ -15,7 +24,7 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-from exceptions import AgentExecutionError, PermissionDeniedError, ValidationError
+from exceptions import AgentExecutionError, ValidationError
 from model.protocol import ChatRequest, ChatResponse
 from observability import get_logger
 from rag.agent_events import AgentAuditTrail, AgentEventType
@@ -27,8 +36,7 @@ from rag.roles import (
     enterprise_qa_definition,
 )
 from rag.tool_sources import LocalToolSource
-from rag.tool_types import ToolContext
-from rag.tools import Guardrails, ToolCallRecord, ToolRegistry
+from rag.tools import Guardrails, ToolRegistry
 from settings import AgentSettings, GuardrailsSettings
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
@@ -46,9 +54,7 @@ class OrchestratorRequest(BaseModel):
     tenant_id: str = "default"
     owner_id: str | None = None
     allowed_sources: list[str] = Field(default_factory=list)
-    history: list[dict[str, str]] = Field(default_factory=list)
     request_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
-    use_hybrid: bool = True
 
 
 class OrchestratorResponse(BaseModel):
@@ -116,7 +122,7 @@ class AgentOrchestrator:
     def run(self, request: OrchestratorRequest) -> OrchestratorResponse:
         blackboard = self._init_blackboard(request)
         trail = blackboard.metadata["trail"]
-        started = time.perf_counter()
+        start_time = time.perf_counter()
 
         trail.record_now(
             event_type=AgentEventType.STARTED,
@@ -132,6 +138,7 @@ class AgentOrchestrator:
             self._guardrails.check_question(request.question)
         except ValidationError:
             raise
+        # 仅 wrap 未预期异常；校验错误保持原始类型向上抛
         except Exception as exc:
             raise ValidationError(f"输入被拒绝: {exc}") from exc
 
@@ -148,8 +155,11 @@ class AgentOrchestrator:
                 details={"request_id": request.request_id},
             ) from exc
 
+        response = self._build_response(
+            request, blackboard, trail, time.perf_counter() - start_time
+        )
         trail.complete()
-        return self._build_response(request, blackboard, trail, time.perf_counter() - started)
+        return response
 
     def _run_pipeline(
         self,
@@ -161,8 +171,8 @@ class AgentOrchestrator:
         self._invoke_retriever(request, blackboard, trail)
         self._invoke_reasoner(request, blackboard, trail)
 
-        review_cfg = self._agent_settings.review
-        if not review_cfg.enabled:
+        review_config = self._agent_settings.review
+        if not review_config.enabled:
             blackboard.review = ReviewReport(
                 approved=True, summary="审核已禁用。", strategy="disabled"
             )
@@ -175,20 +185,25 @@ class AgentOrchestrator:
             )
             return
 
-        max_rounds = max(0, review_cfg.max_retries)
-        for _round in range(max_rounds + 1):
-            blackboard.review_rounds = _round
+        # 首次审核 + 最多 max_retries 次带反馈重试
+        max_retries = max(0, review_config.max_retries)
+        for review_attempt in range(max_retries + 1):
+            blackboard.review_rounds = review_attempt
             report = self._invoke_reviewer(blackboard, trail)
             blackboard.review = report
 
             if report.approved or not report.retryable():
                 break
 
+            # reasoner 已明确拒答（无可用证据）时，仅审一次，不重试
+            if blackboard.metadata.get("reasoner_declined"):
+                break
+
             trail.record_now(
                 event_type=AgentEventType.REVIEW_OVERRIDDEN,
                 node="reviewer",
                 status="retry",
-                data={"round": _round + 1, "issues": report.blocking},
+                data={"round": review_attempt + 1, "issues": report.blocking},
             )
             self._invoke_reasoner(
                 request, blackboard, trail, feedback=report.summary
@@ -209,11 +224,11 @@ class AgentOrchestrator:
         )
 
         try:
-            context = self._retrieval.retrieve(
+            retrieval_result = self._retrieval.retrieve(
                 blackboard.original_question,
                 tenant_id=request.tenant_id,
                 owner_id=request.owner_id,
-                allowed_sources=list(request.allowed_sources),
+                allowed_sources=request.allowed_sources,
             )
         except Exception as exc:
             logger.warning(f"检索失败 | error={exc!s}")
@@ -228,15 +243,16 @@ class AgentOrchestrator:
             return
 
         blackboard.evidence = [
-            self._document_to_evidence(document) for document in context.documents
+            self._document_to_evidence(document)
+            for document in retrieval_result.documents
         ]
         blackboard.rewritten_queries = [blackboard.original_question]
         trail.record_now(
             event_type=AgentEventType.RETRIEVAL,
             node="retriever",
             data={
-                "document_count": len(context.documents),
-                "search_type": context.search_type,
+                "document_count": len(retrieval_result.documents),
+                "search_type": retrieval_result.search_type,
             },
         )
 
@@ -251,6 +267,13 @@ class AgentOrchestrator:
         if not role.can_handle(blackboard):
             blackboard.answer_draft = "（当前没有可用于回答的授权证据。）"
             blackboard.roles_invoked.append(role.definition.name)
+            blackboard.metadata["reasoner_declined"] = True
+            trail.record_now(
+                event_type=AgentEventType.ROLE_DISPATCHED,
+                node="reasoner",
+                status="skipped",
+                message="无可用授权证据，reasoner 直接拒答。",
+            )
             return
 
         blackboard.roles_invoked.append(role.definition.name)
@@ -267,9 +290,9 @@ class AgentOrchestrator:
         if feedback:
             prompt += "\n\n审核反馈（请据此修正，不要引用不存在的来源）：\n" + feedback
 
-        response = self._call_model(prompt, role=role, trail=trail)
-        blackboard.answer_draft = (response.content or "").strip() or None
-        blackboard.metadata["reasoning_model"] = response.model
+        model_response = self._call_model(prompt, role=role, trail=trail)
+        blackboard.answer_draft = (model_response.content or "").strip() or None
+        blackboard.metadata["reasoning_model"] = model_response.model
 
     def _invoke_reviewer(
         self,
@@ -310,44 +333,6 @@ class AgentOrchestrator:
             )
         return report
 
-    def invoke_tool(
-        self,
-        name: str,
-        arguments: dict[str, typing.Any],
-        *,
-        request_id: str,
-        tenant_id: str,
-        owner_id: str | None = None,
-        allowed_sources: list[str] | None = None,
-    ) -> ToolCallRecord:
-        """在白名单内调用一个工具，全程可审计。
-
-        注意：当前流水线不直接调用工具，此方法预留给外部显式调用。
-        """
-        context = ToolContext(
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            allowed_sources=list(allowed_sources or []),
-            request_id=request_id,
-        )
-        self._guardrails.validate_tool_call(name, self._registry)
-
-        try:
-            handler = self._registry.get(name)
-            result = handler(arguments or {}, context)
-            return ToolCallRecord(tool=name, arguments=arguments, result=result)
-        except ValidationError:
-            raise
-        except PermissionDeniedError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                f"工具调用失败 | tool={name} | request_id={request_id} | error={exc!s}"
-            )
-            return ToolCallRecord(
-                tool=name, arguments=arguments, status="error", error=str(exc)
-            )
-
     def _call_model(
         self,
         prompt: str,
@@ -362,9 +347,9 @@ class AgentOrchestrator:
         ]
         request = ChatRequest(messages=messages, tools=[])
 
-        result = self._executor.invoke(request)
+        execution_result = self._executor.invoke(request)
 
-        for attempt in result.attempts:
+        for attempt in execution_result.attempts:
             trail.record_now(
                 event_type=AgentEventType.MODEL_CALL,
                 node=role.definition.name,
@@ -376,32 +361,30 @@ class AgentOrchestrator:
                 latency_seconds=attempt.elapsed_seconds,
             )
 
-        if not result.succeeded or not result.response:
+        if not execution_result.succeeded or not execution_result.response:
             raise AgentExecutionError(
                 f"执行角色 {role.definition.name!r} 时所有模型均调用失败。",
                 details={
                     "role": role.definition.name,
                     "attempts": [
                         {"provider": a.provider, "error": a.error_message}
-                        for a in result.attempts
+                        for a in execution_result.attempts
                     ],
                 },
             )
 
-        return result.response
+        return execution_result.response
 
     def _system_prompt(self) -> str:
-        """拼接角色契约与产品约束，作为系统提示前缀。"""
+        """拼接产品契约与协作规则，作为系统提示前缀。
+
+        角色列表由各 Role.build_prompt 自行负责，此处不重复描述。
+        """
         definition = self._definition
-        roles_text = "\n".join(
-            f"- {role.definition.title}（{role.definition.name}）：{role.definition.purpose}"
-            for role in definition.roles
-        )
         return (
             f"你是 {definition.name}（{definition.version}），{definition.product_purpose}\n"
             f"输入契约：{definition.input_contract}\n"
             f"输出契约：{definition.output_contract}\n"
-            f"参与角色：\n{roles_text}\n"
             "协作规则：先检索、再推理、最后审核；证据不足时明确说明无法确认，不得编造。"
         )
 
@@ -420,42 +403,49 @@ class AgentOrchestrator:
         request: OrchestratorRequest,
         blackboard: Blackboard,
         trail: AgentAuditTrail,
-        duration: float,
+        elapsed_seconds: float,
     ) -> OrchestratorResponse:
         report = blackboard.review
 
-        # 优先使用流水线写入的 review_status（例如 disabled 时为 "skipped"）
-        stored_status = blackboard.metadata.get("review_status")
-        if stored_status:
-            status = str(stored_status)
+        # 优先使用流水线阶段写入的状态（如审核禁用/跳过时为 "skipped"）
+        pipeline_status = blackboard.metadata.get("review_status")
+        if pipeline_status:
+            review_status = str(pipeline_status)
         elif report is None:
-            status = "not_applicable"
+            review_status = "not_applicable"
         elif not report.approved and report.blocking:
-            status = "rejected"
+            review_status = "rejected"
         elif report.warnings:
-            status = "warning"
+            review_status = "warning"
         else:
-            status = "approved"
+            review_status = "approved"
 
-        # 审核被拒时返回安全拒答，不把被拒的草稿暴露给用户
-        if status == "rejected":
-            answer = _safe_refusal(blackboard)
+        if review_status == "rejected":
+            # 不暴露被拒草稿
+            answer = _refusal_message(blackboard)
         else:
-            answer = blackboard.answer_draft or _safe_refusal(blackboard)
+            answer = blackboard.answer_draft or _refusal_message(blackboard)
 
-        return OrchestratorResponse(
+        response = OrchestratorResponse(
             request_id=request.request_id,
             answer=answer,
-            citations=_evidence_to_citations(blackboard.evidence),
-            review=report if isinstance(report, ReviewReport) else None,
-            review_status=status,
+            citations=_build_citations(blackboard.evidence),
+            review=report,
+            review_status=review_status,
             review_rounds=blackboard.review_rounds,
-            roles_invoked=list(dict.fromkeys(blackboard.roles_invoked)),
+            roles_invoked=list(blackboard.roles_invoked),
             documents=blackboard.evidence,
             trail=trail,
-            duration_seconds=duration,
+            duration_seconds=elapsed_seconds,
             model=blackboard.metadata.get("reasoning_model"),
         )
+        trail.record_now(
+            event_type=AgentEventType.FINALIZED,
+            node="orchestrator",
+            status=review_status,
+            data={"answer_replaced": review_status == "rejected"},
+        )
+        return response
 
     @staticmethod
     def _document_to_evidence(document: RetrievedDocument) -> dict[str, typing.Any]:
@@ -474,21 +464,32 @@ class AgentOrchestrator:
         }
 
 
-def _safe_refusal(blackboard: Blackboard) -> str:
-    """当没有任何可用答案时返回的安全兜底文案。"""
-    if blackboard.evidence:
-        return "根据已授权知识库，无法找到足以回答该问题的证据。建议补充相关文档或缩小问题范围。"
-    return "当前没有可访问的授权文档能够回答该问题。请确认文档已入库，或联系知识库管理员。"
+def _refusal_message(blackboard: Blackboard) -> str:
+    """生成拒答文案，按「无证据 / 有证据但审核拒绝」两种原因区分。"""
+    if not blackboard.evidence:
+        return (
+            "当前没有可访问的授权文档能够回答该问题。"
+            "请确认文档已入库，或联系知识库管理员。"
+        )
+    if blackboard.review is not None and not blackboard.review.approved:
+        return (
+            "已检索到相关文档，但回答未通过审核，暂不提供该结论。"
+            "建议补充或缩小问题范围后重试。"
+        )
+    return (
+        "根据已授权知识库，无法找到足以回答该问题的证据。"
+        "建议补充相关文档或缩小问题范围。"
+    )
 
 
-def _snippet(text: str, limit: int = 600) -> str:
+def _snippet(text: str, max_length: int = 600) -> str:
     if not isinstance(text, str):
         text = str(text)
-    cleaned = " ".join(text.split())
-    return cleaned[:limit] + ("…" if len(cleaned) > limit else "")
+    normalized = " ".join(text.split())
+    return normalized[:max_length] + ("…" if len(normalized) > max_length else "")
 
 
-def _evidence_to_citations(
+def _build_citations(
     evidence: list[dict[str, typing.Any]]
 ) -> list[dict[str, typing.Any]]:
     return [
