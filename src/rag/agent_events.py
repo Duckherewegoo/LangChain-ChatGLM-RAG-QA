@@ -14,7 +14,7 @@ import uuid
 
 from pydantic import BaseModel, Field, model_serializer
 
-from observability import get_logger
+from base.observability import get_logger
 
 logger = get_logger(__name__)
 

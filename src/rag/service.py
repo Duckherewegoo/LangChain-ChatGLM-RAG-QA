@@ -12,9 +12,9 @@ import typing
 
 from pydantic import BaseModel, Field
 
-from exceptions import ModelInvocationError, RetrievalError, ValidationError
+from base.exceptions import ModelInvocationError, RetrievalError, ValidationError
 from model import ChatModel, ChatRequest, ChatResponse, FallbackExecutor, FallbackResult
-from observability import get_logger
+from base.observability import get_logger
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from model.embedding import EmbeddingModel

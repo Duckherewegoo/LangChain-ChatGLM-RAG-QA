@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import typing
 
-from exceptions import ConfigurationError
+from base.exceptions import ConfigurationError
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from model.protocol import ChatModel

@@ -7,7 +7,7 @@ import json
 import typing
 
 from model.protocol import ChatModel, ChatRequest
-from observability import get_logger
+from base.observability import get_logger
 
 from .types import QueryRewrite
 

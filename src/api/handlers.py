@@ -21,10 +21,10 @@ from api.schemas import (
     HealthResponseBody,
     RetrievedDocumentView,
 )
-from exceptions import ConfigurationError
+from base.exceptions import ConfigurationError
 from model import ProviderHealth
 from model.health import check_chain
-from observability import get_logger
+from base.observability import get_logger
 from rag.container import Container
 from rag.agent import AgentRequest, AgentResponse
 from rag.orchestrator import OrchestratorRequest

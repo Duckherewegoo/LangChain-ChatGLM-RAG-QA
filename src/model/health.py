@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from model.errors import classify_model_error
 from model.protocol import ChatModel, ChatRequest
-from observability import get_logger
+from base.observability import get_logger
 
 if typing.TYPE_CHECKING:
     from collections.abc import Iterable

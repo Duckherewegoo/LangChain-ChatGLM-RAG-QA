@@ -19,7 +19,7 @@ import threading
 import typing
 
 from data_process.pipeline import IngestPipeline
-from exceptions import ConfigurationError
+from base.exceptions import ConfigurationError
 from model import (
     ChatModel,
     EmbeddingModel,
@@ -27,7 +27,7 @@ from model import (
     ModelRouter,
     create_embedding_model,
 )
-from observability import get_logger
+from base.observability import get_logger
 from rag.agent import AgentRunner, create_agent_runner
 from rag.collection_policy import (
     CollectionCompatibilityError,

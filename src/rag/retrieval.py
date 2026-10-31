@@ -7,9 +7,9 @@ from contextlib import nullcontext
 
 from pydantic import BaseModel
 
-from exceptions import RetrievalError, ValidationError
+from base.exceptions import RetrievalError, ValidationError
 from model.embedding import EmbeddingModel
-from observability import get_logger, get_metric
+from base.observability import get_logger, get_metric
 from rag.reranker import Reranker, create_reranker
 from rag.types import RetrievedContext, RetrievedDocument
 

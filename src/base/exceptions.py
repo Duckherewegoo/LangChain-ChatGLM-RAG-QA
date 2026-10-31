@@ -30,7 +30,11 @@ class RAGError(Exception):
         self.trace_id = trace_id
 
     def to_dict(self) -> dict[str, Any]:
-        """将异常转换为标准的字典格式，供 API 层直接返回。"""
+        """将异常转换为标准的字典格式，供 API 层直接返回。
+
+        注意：details 是开发者诊断信息，可能包含模型名、尝试记录等内部标识，
+        对外暴露前应由 api/middleware 按需过滤。
+        """
         payload = {
             "error": self.error_code,
             "message": self.message,
@@ -58,8 +62,8 @@ class ValidationError(RAGError):
 
 
 class ModelNotConfiguredError(RAGError):
-    """无法根据当前配置构建有效的模型客户端。"""
-    status_code = 503
+    """无法根据当前配置构建有效的模型客户端。配置缺失是永久性错误。"""
+    status_code = 500
     error_code = "model_not_configured"
 
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from exceptions import ModelInvocationError, ModelNotConfiguredError
+from base.exceptions import ModelInvocationError, ModelNotConfiguredError
 
 # ==================== 细粒度异常定义 ====================
 

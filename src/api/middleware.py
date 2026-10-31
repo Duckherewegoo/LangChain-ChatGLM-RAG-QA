@@ -13,8 +13,8 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-from exceptions import RAGError
-from observability import get_logger, start_request
+from base.exceptions import RAGError
+from base.observability import get_logger, start_request
 
 logger = get_logger(__name__)
 

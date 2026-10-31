@@ -6,7 +6,7 @@ import json
 import os
 import typing
 
-from exceptions import DocumentLoadError
+from base.exceptions import DocumentLoadError
 
 _MAX_SCAN_DEPTH = 12
 

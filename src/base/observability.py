@@ -7,6 +7,7 @@ import sys
 import time
 import typing
 import uuid
+from contextlib import contextmanager
 from contextvars import ContextVar
 
 from loguru import logger as loguru_logger
@@ -35,6 +36,16 @@ _METRIC_REGISTRY: dict[str, typing.Any] = {}
 # 日志配置（Loguru 接管一切）
 # ============================================================
 
+def _patch_log_record(record: dict[str, typing.Any]) -> None:
+    """为所有日志记录注入动态字段。
+
+    - request_id：从 ContextVar 实时读取，避免模块级 logger 在 import 时固化；
+    - module：未显式 bind 时用记录来源名兜底（第三方日志由此获得可读模块名）。
+    """
+    record["extra"]["request_id"] = _REQUEST_CONTEXT.get().get("request_id", "-")
+    record["extra"].setdefault("module", record["name"])
+
+
 class InterceptHandler(logging.Handler):
     """将标准 logging 日志桥接到 Loguru。"""
 
@@ -49,14 +60,19 @@ class InterceptHandler(logging.Handler):
             frame = frame.f_back
             depth += 1
 
-        loguru_logger.opt(depth=depth, exception=record.exc_info).log(
-            level, record.getMessage()
-        )
+        # 绑定原始 logger 名，让第三方日志的 module 字段有意义。
+        loguru_logger.bind(module=record.name).opt(
+            depth=depth, exception=record.exc_info
+        ).log(level, record.getMessage())
 
 
 def configure_observability(log_level: str = "INFO", metrics_enabled: bool = True) -> None:
-    """配置 Loguru 与 Prometheus 指标。"""
+    """配置 Loguru 与 Prometheus 指标。
+
+    可重复调用；已注册的 Prometheus metric 不会重复创建。
+    """
     loguru_logger.remove()
+    loguru_logger.configure(patcher=_patch_log_record)
     loguru_logger.add(
         sys.stdout,
         level=log_level.upper(),
@@ -83,11 +99,11 @@ def configure_observability(log_level: str = "INFO", metrics_enabled: bool = Tru
 
 
 def get_logger(name: str | None = None) -> typing.Any:
-    """返回一个绑定了模块名的 Loguru logger。"""
-    return loguru_logger.bind(
-        module=name or "root",
-        request_id=_REQUEST_CONTEXT.get().get("request_id", "-"),
-    )
+    """返回绑定了模块名的 Loguru logger。
+
+    request_id 由 patcher 在每条日志记录时动态注入，不在此处固化。
+    """
+    return loguru_logger.bind(module=name or "root")
 
 
 # ============================================================
@@ -118,6 +134,7 @@ def finish_request() -> float:
     return elapsed
 
 
+@contextmanager
 def request_scope(request_id_value: str | None = None) -> typing.Iterator[str]:
     """上下文管理器形式管理请求生命周期。"""
     rid = start_request(request_id_value)
@@ -148,6 +165,7 @@ def _initialize_metrics() -> None:
     _create_metric("request_latency", lambda: Histogram(
         "rag_http_request_duration_seconds", "HTTP request latency.", ["method", "endpoint"]
     ))
+    # tenant_id 为高基数 label，生产环境应改为低基数维度（如 tenant_tier）。
     _create_metric("retrieval_documents", lambda: Histogram(
         "rag_retrieved_documents_total", "Documents retrieved per query.", ["tenant_id"]
     ))

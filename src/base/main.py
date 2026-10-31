@@ -8,21 +8,24 @@ from __future__ import annotations
 
 import sys
 
-from observability import (
+from base.observability import (
     configure_observability,
     get_logger,
     shutdown_observability,
 )
 from settings import load_settings
 
-from dotenv import load_dotenv
-load_dotenv()  # 读取 .env
-
 logger = get_logger(__name__)
 
 
 def main() -> int:
     """加载配置、构建应用并运行 HTTP 服务。"""
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
 
     try:
         settings = load_settings()
@@ -38,15 +41,15 @@ def main() -> int:
     try:
         from api.server import create_app
         from rag.container import initialize_container
-    except Exception as exc:
-        logger.exception(f"应用初始化失败 | error={exc}")
+    except Exception:
+        logger.exception("应用初始化失败")
         return 3
 
     try:
         container = initialize_container(settings)
         app = create_app(container)
-    except Exception as exc:
-        logger.exception(f"容器或应用装配失败 | error={exc}")
+    except Exception:
+        logger.exception("容器或应用装配失败")
         return 3
 
     import uvicorn
@@ -62,8 +65,8 @@ def main() -> int:
     except KeyboardInterrupt:
         logger.info("应用被中断")
         return 0
-    except Exception as exc:
-        logger.exception(f"服务启动失败 | error={exc}")
+    except Exception:
+        logger.exception("服务启动失败")
         return 4
     finally:
         try:

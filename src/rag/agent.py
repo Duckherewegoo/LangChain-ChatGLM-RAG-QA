@@ -19,9 +19,9 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-from exceptions import AgentExecutionError, RAGError, ValidationError
+from base.exceptions import AgentExecutionError, RAGError, ValidationError
 from model import ChatRequest, FallbackExecutor
-from observability import get_logger, get_metric
+from base.observability import get_logger, get_metric
 from rag.agent_events import (
     AgentAuditTrail,
     AgentEvent,

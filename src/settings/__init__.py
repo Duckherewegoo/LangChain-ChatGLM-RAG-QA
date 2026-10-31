@@ -22,7 +22,7 @@ from settings.settings import (
     load_settings,
 )
 
-from exceptions import ConfigurationError
+from base.exceptions import ConfigurationError
 
 __all__ = [
     "AgentSettings",

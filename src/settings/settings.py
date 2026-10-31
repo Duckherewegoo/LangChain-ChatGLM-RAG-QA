@@ -16,9 +16,9 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, ValidationError
 
-from exceptions import ConfigurationError
+from base.exceptions import ConfigurationError
 from model.routing_types import ModelEmbeddingSettings, ModelRouterSettings
-from observability import get_logger
+from base.observability import get_logger
 
 logger = get_logger(__name__)
 

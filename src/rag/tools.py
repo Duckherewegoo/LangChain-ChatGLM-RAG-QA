@@ -19,7 +19,7 @@ import typing
 
 from pydantic import BaseModel, Field
 
-from exceptions import AgentExecutionError, PermissionDeniedError, ValidationError
+from base.exceptions import AgentExecutionError, PermissionDeniedError, ValidationError
 from rag.tool_sources import (
     LocalToolSource,
     ToolSource,

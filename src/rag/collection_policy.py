@@ -13,7 +13,7 @@ import typing
 
 from pydantic import BaseModel
 
-from exceptions import ConfigurationError, IngestError
+from base.exceptions import ConfigurationError, IngestError
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
     from model.embedding import EmbeddingModel

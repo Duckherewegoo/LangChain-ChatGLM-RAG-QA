@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import typing
 
-from exceptions import ModelConfigurationError
+from base.exceptions import ModelConfigurationError
 from model.providers.openai_compatible import OpenAICompatibleChatModel
 from model.registry import register_provider
 

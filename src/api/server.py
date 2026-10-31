@@ -46,8 +46,8 @@ from api.schemas import (
     MessageResponseBody,
     RetrievedDocumentView,
 )
-from exceptions import RAGError, ResourceNotFoundError, ValidationError
-from observability import (
+from base.exceptions import RAGError, ResourceNotFoundError, ValidationError
+from base.observability import (
     collect_metrics,
     configure_observability,
     finish_request,

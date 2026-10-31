@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import typing
 
-from exceptions import ConfigurationError
+from base.exceptions import ConfigurationError
 from model.protocol import ChatModel
-from observability import get_logger
+from base.observability import get_logger
 
 from .fusers import DeduplicatingFuser, ReciprocalRankFusion, ResultFuser, ScoreWeightedFuser
 from .rewriters import ExpansionRewriter, IdentityRewriter, LLMQueryRewriter, QueryRewriter

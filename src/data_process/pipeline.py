@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Iterable
 
-from exceptions import DocumentLoadError, IngestError
-from observability import get_logger
+from base.exceptions import DocumentLoadError, IngestError
+from base.observability import get_logger
 from rag.types import RetrievedDocument
 
 from .chunker import DocumentChunker, compute_document_id, normalize_whitespace

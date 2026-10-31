@@ -6,7 +6,7 @@ import typing
 
 from pydantic import Field
 
-from observability import get_logger
+from base.observability import get_logger
 from rag.types import RetrievedContext
 
 from .fusers import ResultFuser

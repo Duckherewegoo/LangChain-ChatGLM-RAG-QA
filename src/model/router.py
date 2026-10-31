@@ -14,7 +14,7 @@ import importlib
 import threading
 import typing
 
-from exceptions import ConfigurationError, ResourceNotFoundError
+from base.exceptions import ConfigurationError, ResourceNotFoundError
 from model.routing_types import (
     ModelCapabilitySettings,
     ModelRouterSettings,
