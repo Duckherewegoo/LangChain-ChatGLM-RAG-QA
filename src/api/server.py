@@ -5,6 +5,7 @@
 """
 
 from __future__ import annotations
+from importlib.metadata import version
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,7 +50,7 @@ from rag.service import AnswerRequest
 from settings import load_settings
 
 logger = get_logger(__name__)
-
+value = version("langchain-chatglm-rag-qa")
 
 def create_app(container: Container | None = None) -> FastAPI:
     """创建并配置 FastAPI 应用。"""
@@ -59,7 +60,7 @@ def create_app(container: Container | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Enterprise RAG Assistant",
-        version="0.1.0",
+        version=value,
         description="基于 LangChain/LangGraph 的 RAG 服务，支持 ChatGLM/Qwen/DeepSeek 多模型。",
     )
     app.state.container = dependencies
