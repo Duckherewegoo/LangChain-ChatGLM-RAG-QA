@@ -2,6 +2,9 @@
 
 这些模型定义了对 HTTP 客户端暴露的 JSON 契约。它们刻意只复制传输所需的字段，
 而不复用内部领域模型，从而保持 API 向后兼容，并独立于内部重构。
+
+校验分层：本层只做结构校验（类型、非空）；业务校验（问题长度上限等）
+由 Guardrails 在领域层完成，避免 schema 与配置出现两个长度上限。
 """
 
 from __future__ import annotations
@@ -14,27 +17,27 @@ from pydantic import BaseModel, Field
 class AnswerRequestBody(BaseModel):
     """同步 RAG 请求的传输模型。"""
 
-    question: str = Field(..., min_length=1, max_length=4000)
+    question: str = Field(..., min_length=1)
     tenant_id: str = "default"
     owner_id: str | None = None
     allowed_sources: list[str] = Field(default_factory=list)
     top_k: int | None = Field(default=None, ge=1, le=100)
     history: list[dict[str, str]] = Field(default_factory=list)
-    additional_context: str | None = None
-    model: str | None = Field(default=None, description="从 model_router.models 中选择的命名模型")
-    use_case: str = Field(default="chat", description="路由用例，如 chat 或 agent")
+    additional_context: str | None = Field(default=None, description="预留：当前 handler 未消费")
+    model: str | None = Field(default=None, description="预留：当前由服务端配置决定，未消费")
+    use_case: str = Field(default="chat", description="路由用例；当前仅出现在错误详情，不参与路由")
 
 
 class AgentRequestBody(BaseModel):
     """Agent 请求的传输模型。"""
 
-    question: str = Field(..., min_length=1, max_length=4000)
+    question: str = Field(..., min_length=1)
     tenant_id: str = "default"
     owner_id: str | None = None
     allowed_sources: list[str] = Field(default_factory=list)
     history: list[dict[str, str]] = Field(default_factory=list)
-    additional_context: str | None = None
-    use_case: str = "agent"
+    additional_context: str | None = Field(default=None, description="预留：handler 会告警并丢弃")
+    use_case: str = Field(default="agent", description="预留：handler 当前丢弃，未消费")
 
 
 class IngestRequestBody(BaseModel):
@@ -100,12 +103,12 @@ class AgentResponseBody(BaseModel):
 
     request_id: str
     answer: str
-    citations: list[dict[str, typing.Any]] = Field(default_factory=list)
+    citations: list[CitationView] = Field(default_factory=list)
     tool_calls: list[AgentToolCallView] = Field(default_factory=list)
     iterations: int = 0
     stopped_reason: str = "completed"
     model: str | None = None
-    documents: list[dict[str, typing.Any]] = Field(default_factory=list)
+    documents: list[RetrievedDocumentView] = Field(default_factory=list)
     attempted_models: list[str] = Field(default_factory=list)
     fallback_used: bool = False
 
@@ -119,6 +122,7 @@ class IngestResponseBody(BaseModel):
     scanned: int = 0
     chunks_stored: int = 0
     bytes_size: int = 0
+    errors: list[dict[str, str]] = Field(default_factory=list, description="逐文件失败明细；空表示全部成功")
     request_id: str | None = None
 
 

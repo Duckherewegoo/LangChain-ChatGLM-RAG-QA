@@ -68,8 +68,8 @@ class VectorStore(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def count(self, tenant_id: str = "default") -> int:
-        """返回持久化的块数量。"""
+    def count(self) -> int:
+        """返回全集合的块数量；不支持按租户计数。"""
         ...
 
     @abc.abstractmethod
@@ -109,12 +109,10 @@ class ChromaVectorStore(VectorStore):
         self,
         collection: str = "enterprise_knowledge",
         persist_directory: str | os.PathLike[str] = "./data/index",
-        tenant_id: str = "default",
         hnsw_space: str = "cosine",
     ) -> None:
         self._collection_name = collection
         self._persist_directory = os.path.abspath(persist_directory)
-        self._tenant_id = tenant_id
         self._hnsw_space = hnsw_space
         self._client: ClientAPI | None = None
         self._collection: typing.Any = None
@@ -138,12 +136,13 @@ class ChromaVectorStore(VectorStore):
                 settings=ChromaSettings(anonymized_telemetry=False),
             )
             metadata = {"hnsw:space": self._hnsw_space}
-            try:
-                self._collection = self._client.get_collection(name=self._collection_name)
-            except Exception:
-                self._collection = self._client.create_collection(
-                    name=self._collection_name, metadata=metadata
-                )
+            # 使用 get_or_create_collection：集合不存在时用 metadata 创建，
+            # 已存在时直接获取；连接失败会向上抛出，避免被误判为"不存在"。
+            # 相比 try/get + except NotFoundError，不依赖 chromadb 各版本
+            # 不一致的异常类名。
+            self._collection = self._client.get_or_create_collection(
+                name=self._collection_name, metadata=metadata
+            )
             self._refresh_dimension()
         return self._collection
 
@@ -263,6 +262,11 @@ class ChromaVectorStore(VectorStore):
         return results
 
     def delete_by_document(self, document_id: str, tenant_id: str = "default") -> int:
+        """删除某文档的所有块。
+
+        先 get 再 delete 两步非原子：与并发摄入重叠时，新写入的块可能漏删。
+        返回本次删除的 id 数量。
+        """
         collection = self._get_collection()
         # 修复：查条件删记录时，不应该传空 ids=[]
         existing = collection.get(
@@ -274,9 +278,9 @@ class ChromaVectorStore(VectorStore):
         collection.delete(ids=list(target_ids))
         return len(target_ids)
 
-    def count(self, tenant_id: str = "default") -> int:
-        collection = self._get_collection()
-        return int(collection.count())
+    def count(self) -> int:
+        """返回全集合的块数量；不支持按租户计数。"""
+        return int(self._get_collection().count())
 
     def close(self) -> None:
         self._collection = None
@@ -300,7 +304,6 @@ class ChromaVectorStore(VectorStore):
             "dimension": self.dimension(),
             "stored_dimension": metadata.get("dimension"),
             "hnsw_space": metadata.get("hnsw:space", self._hnsw_space),
-            "tenant_id": self._tenant_id,
         }
 
     @staticmethod
@@ -316,10 +319,12 @@ class ChromaVectorStore(VectorStore):
         if record.owner_id:
             metadata["owner_id"] = record.owner_id
         if record.tags:
+            # 逗号分隔：tag 本身含逗号会被错误切分；需要严格保真时改用 JSON 序列化。
             metadata["tags"] = ",".join(record.tags)
         for key, value in record.metadata.items():
             if isinstance(value, (str, int, float, bool)) or value is None:
                 metadata[key] = value
+        # 复杂类型（dict / list）ChromaDB 不支持，已丢弃；需要持久化时先序列化为字符串。
         return metadata
 
     @staticmethod
@@ -359,6 +364,11 @@ class ChromaVectorStore(VectorStore):
 
     @staticmethod
     def _distance_to_similarity(distance: typing.Any) -> float:
+        """把 ChromaDB 的 cosine distance 转成 [0, 1] 相似度。
+
+        未归一化向量可能产生负相似度（1 - distance < 0），此处截断为 0；
+        需要保留负值时改为 max(-1.0, 1.0 - value)。
+        """
         if distance is None:
             return 0.0
         try:
