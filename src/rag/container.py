@@ -5,10 +5,17 @@
 
 容器绝不直接实例化提供者 SDK。它向 ModelRouter 请求已配置的模型链，并将结果包裹在
 FallbackExecutor 中，从而让应用的其余部分对当前激活的模型保持无感知。
+
+线程安全说明：
+    get_container / initialize_container / shutdown_container 由模块级 RLock 保护，
+    保证单例初始化的原子性。但锁不覆盖"请求使用容器"的生命周期——
+    运行期调用 get_container(reload=True) 会关闭其他请求正在使用的容器。
+    因此 reload 应仅用于启动期与测试。
 """
 
 from __future__ import annotations
 
+import threading
 import typing
 
 from data_process.pipeline import IngestPipeline
@@ -43,12 +50,14 @@ from rag.tools import Guardrails, ToolRegistry, create_rag_tool_registry
 from rag.vector_store import VectorStore, create_vector_store
 
 if typing.TYPE_CHECKING:  # 仅用于类型检查
+    from rag.agent_events import AgentAuditTrail
     from rag.strategies import InMemoryBM25Index
     from settings import AppSettings
 
 logger = get_logger(__name__)
 
 _container: "Container | None" = None
+_container_lock = threading.RLock()
 
 
 class AgentTrailStore:
@@ -56,23 +65,30 @@ class AgentTrailStore:
 
     保留轨迹是为了让调用方能够重放推理、工具和模型事件的精确序列。
     这刻意设计为进程内缓存；如果审计需要在重启后存活，生产部署应将其替换为持久化存储。
+
+    并发说明：put 涉及"检查长度 + 淘汰 + 写入"三步，必须加锁；
+    get / __contains__ 也加锁，保证与 put 的可观测一致性。
     """
 
     def __init__(self, max_entries: int = 256) -> None:
         self._max_entries = max(1, max_entries)
-        self._store: dict[str, typing.Any] = {}
+        self._store: dict[str, "AgentAuditTrail"] = {}
+        self._lock = threading.Lock()
 
-    def put(self, request_id: str, trail: typing.Any) -> None:
-        self._store[request_id] = trail
-        while len(self._store) > self._max_entries:
-            oldest = next(iter(self._store))
-            self._store.pop(oldest, None)
+    def put(self, request_id: str, trail: "AgentAuditTrail") -> None:
+        with self._lock:
+            self._store[request_id] = trail
+            while len(self._store) > self._max_entries:
+                oldest = next(iter(self._store))
+                self._store.pop(oldest, None)
 
-    def get(self, request_id: str) -> typing.Any | None:
-        return self._store.get(request_id)
+    def get(self, request_id: str) -> "AgentAuditTrail | None":
+        with self._lock:
+            return self._store.get(request_id)
 
     def __contains__(self, request_id: str) -> bool:
-        return request_id in self._store
+        with self._lock:
+            return request_id in self._store
 
 
 class Container:
@@ -166,6 +182,8 @@ class Container:
             method = self._settings.retrieval.query_rewrite or "expansion"
             rewrite_cfg: dict[str, typing.Any] = {"method": method}
             use_llm = method == "llm"
+            # 注（M2）：rewrite 是便宜任务，理想应走 route("rewrite") 或小模型；
+            # 当前无独立 use_case 配置，暂复用 "chat"。
             model = self.model_router().route("chat").primary if use_llm else None
             self._query_rewriter = create_query_rewriter(rewrite_cfg, model=model)
         return self._query_rewriter
@@ -186,6 +204,10 @@ class Container:
         cfg = self._settings.retrieval.keyword
         if not cfg.enabled:
             return None
+        # 已知问题（P0-1）：此索引构造后从未被写入——IngestPipeline 只写
+        # vector_store。keyword 分支对任何 query 都返回空，hybrid 实际退化
+        # 为纯 vector。完整修复需让 IngestPipeline 写入此索引，或启动时
+        # 从 vector_store 回填原文（BM25 需要原文，回填成本较高）。
         self._keyword_index = InMemoryBM25Index()
         return KeywordRetrievalStrategy(self._keyword_index)
 
@@ -219,6 +241,10 @@ class Container:
         if self._reviewer is None:
             review_cfg = self._settings.agent.review
             use_llm = review_cfg.use_llm
+            # 已知取舍（P1-5）：审核模型不走 FallbackExecutor。primary 不可用
+            # 时审核直接降级为规则审核（reviewer.py 的 except 分支），而规则
+            # 审核无法检查越权披露等语义问题。生成链路有 fallback，审核链路
+            # 没有——这是已知的不对称；修复需让 AnswerReviewer 接受 executor。
             model = self.model_router().route("chat").primary if use_llm else None
             self._reviewer = AnswerReviewer(
                 model=model,
@@ -234,6 +260,12 @@ class Container:
     # ---- Agent 层 ----------------------------------------------------------
 
     def agent_runner(self) -> AgentRunner:
+        """返回 LangGraph 智能体运行时。
+
+        注意（P0-2）：本路径无审核节点——finalize 直接出答案。
+        与 agent_orchestrator()（无 LangGraph、有审核）是两套独立实现，
+        对外叙事需明确"两个端点、两种模式"。
+        """
         if self._agent_runner is None:
             self._agent_runner = create_agent_runner(
                 executor=self.model_executor(),
@@ -245,7 +277,11 @@ class Container:
         return self._agent_runner
 
     def agent_orchestrator(self) -> AgentOrchestrator:
-        """返回用于 Agent 端点的多角色编排器。"""
+        """返回手写多角色编排器（含审核）。
+
+        注意（P0-2）：本路径无 LangGraph 图，是 retrieve→reason→review
+        手写循环。与 agent_runner()（有 LangGraph、无审核）是两套独立实现。
+        """
         if self._orchestrator is None:
             self._orchestrator = AgentOrchestrator(
                 executor=self.model_executor(),
@@ -276,29 +312,45 @@ class Container:
 
     # ---- 生命周期 ----------------------------------------------------------
 
+    def __enter__(self) -> "Container":
+        return self
+
+    def __exit__(self, *exc_info: typing.Any) -> None:
+        self.shutdown()
+
     def shutdown(self) -> None:
         """释放共享资源。
 
         优先调用 close()，没有则回退到 shutdown()，因为不同组件的清理方法名不统一。
+
+        顺序按"高层 → 底层"：先关 agent_runner / orchestrator，再关 executor /
+        embedder / router，避免底层被 close 后高层仍持有引用。
         """
         for component in (
             self._agent_runner,
+            self._orchestrator,
+            self._hybrid,
             self._reviewer,
             self._rag_service,
-            self._hybrid,
             self._retrieval,
+            self._ingest_pipeline,
             self._tool_registry,
             self._vector_store,
+            self._query_rewriter,
+            self._executor,
+            self._embedder,
+            self._router,
+            self._guardrails,
         ):
             if component is None:
                 continue
             try:
-                close = getattr(component, "close", None)
-                shutdown = getattr(component, "shutdown", None)
-                if callable(close):
-                    close()
-                elif callable(shutdown):
-                    shutdown()
+                close_fn = getattr(component, "close", None)
+                shutdown_fn = getattr(component, "shutdown", None)
+                if callable(close_fn):
+                    close_fn()
+                elif callable(shutdown_fn):
+                    shutdown_fn()
             except Exception as exc:
                 logger.warning(f"组件关闭失败 | error={exc!s}")
 
@@ -327,13 +379,18 @@ class Container:
         if configured and configured.models:
             return ModelRouter(configured)
         logger.info(
-            f"model_router_using_legacy_configuration | provider={self._settings.model_chat.provider} | model_name={self._settings.model_chat.model_name}"
+            "model_router_using_legacy_configuration | provider=%s | model_name=%s",
+            self._settings.model_chat.provider,
+            self._settings.model_chat.model_name,
         )
         return ModelRouter(_legacy_router_settings(self._settings))
 
     def _build_executor(self) -> FallbackExecutor:
         route = self.model_router().route("chat")
-        # max_retries 语义是"重试次数"，max_attempts_per_provider 语义是"总尝试次数"
+        # max_retries 语义是"重试次数"（不含首次），因此总尝试次数 = max_retries + 1。
+        # 注意（P1-4）：FallbackExecutor.max_attempts_per_provider 的确切语义
+        # （"每 provider 总尝试"还是"合计"）需以 FallbackExecutor 实现为准；
+        # 若为"每 provider"，多 provider 下总调用 = max_attempts × provider 数。
         max_attempts = max(1, self._settings.model_chat.max_retries + 1)
         return FallbackExecutor(
             primary=route.primary,
@@ -355,6 +412,9 @@ class Container:
             persist_directory=self._settings.retrieval.vector_store.persist_directory,
         )
         stored_dimension = store.dimension()
+        # 注意（M5）：空库首次初始化时 stored_dimension 可能为 None。
+        # validate_compatibility 的 None 处理需在 collection_policy.py 确认；
+        # 若其抛异常，首次部署空库会启动失败。
         try:
             from rag.collection_policy import validate_compatibility
 
@@ -395,6 +455,9 @@ def _legacy_router_settings(settings: AppSettings) -> typing.Any:
                 timeout_seconds=settings.model_chat.timeout_seconds,
                 max_retries=settings.model_chat.max_retries,
                 capabilities=ModelCapabilitySettings(
+                    # 注意（M1）：此处假定旧版 chat 模型支持 tool calling。
+                    # 若实际模型不支持，agent.py 的 registry.list_tools() 会在
+                    # 模型侧报错。长期应改为从配置读取或启动时探测能力。
                     supports_tools=True,
                     supports_streaming=True,
                 ),
@@ -416,29 +479,42 @@ def initialize_container(settings: AppSettings | None = None) -> Container:
 
     if settings is None:
         settings = load_settings()
-    if _container is not None:
-        _container.shutdown()
-    _container = Container(settings)
+    with _container_lock:
+        if _container is not None:
+            _container.shutdown()
+        _container = Container(settings)
     logger.info("容器初始化完成。")
     return _container
 
 
 def get_container(reload: bool = False) -> Container:
-    """返回当前激活的容器，首次访问时创建。"""
+    """返回当前激活的容器，首次访问时创建。
+
+    reload=True 会关闭当前容器并创建新容器——这不是运行期安全操作：
+    其他请求若已持有旧容器引用，会拿到已关闭的组件。请仅在启动期与测试使用。
+    """
     global _container
 
-    if _container is None or reload:
-        _container = initialize_container()
-    return _container
+    with _container_lock:
+        if _container is None:
+            return initialize_container()
+        if reload:
+            logger.warning(
+                "容器 reload 请求：旧容器即将关闭，正在使用它的请求可能失败。"
+                "reload 应仅用于启动期与测试。"
+            )
+            return initialize_container()
+        return _container
 
 
 def shutdown_container() -> None:
     """如果存在，关闭当前激活的容器。"""
     global _container
 
-    if _container is not None:
-        _container.shutdown()
-        _container = None
+    with _container_lock:
+        if _container is not None:
+            _container.shutdown()
+            _container = None
 
 
 __all__ = [
