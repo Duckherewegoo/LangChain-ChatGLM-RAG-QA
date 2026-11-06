@@ -108,13 +108,40 @@ class FallbackExecutor:
                     result.response = attempt.response
                     return result
 
+                # 👇 核心修复：不可重试错误，直接中断整个链路
                 if not attempt.retryable:
-                    break
+                    return _finalize(result)
+                    
                 if attempt_index < self._max_attempts - 1:
                     time.sleep(_backoff_seconds(attempt_index))
 
         return _finalize(result)
 
+    async def ainvoke(self, request: ChatRequest) -> FallbackResult:
+        """在回退链上异步执行请求。"""
+        result = FallbackResult()
+        total = 0
+        for model in self._chain:
+            for attempt_index in range(self._max_attempts):
+                if self._max_total is not None and total >= self._max_total:
+                    return _finalize(result)
+                total += 1
+                attempt = await self._try_once_async(model, request, attempt_index)
+                result.attempts.append(attempt)
+
+                if attempt.status == "success":
+                    result.succeeded = True
+                    result.response = attempt.response
+                    return result
+
+                # 👇 核心修复：不可重试错误，直接中断整个链路
+                if not attempt.retryable:
+                    return _finalize(result)
+                    
+                if attempt_index < self._max_attempts - 1:
+                    await asyncio.sleep(_backoff_seconds(attempt_index))
+
+        return _finalize(result)
     async def ainvoke(self, request: ChatRequest) -> FallbackResult:
         """在回退链上异步执行请求。"""
         result = FallbackResult()
