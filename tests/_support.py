@@ -29,6 +29,7 @@ class FakeChatModel:
         self._settings = settings
         self.tool_calls: list[dict[str, typing.Any]] = []
         self.tools: list[dict[str, typing.Any]] = []
+        self.model_name = self._settings.model_name
         self.responses: list[ChatResponse] = [
             ChatResponse(
                 content="基于资料，答案是42。",

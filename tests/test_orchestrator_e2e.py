@@ -11,7 +11,7 @@ import typing
 
 import pytest
 
-from exceptions import ValidationError
+from base.exceptions import ValidationError
 from model.fallback import FallbackExecutor
 from model.protocol import ChatRequest, ChatResponse
 from rag.orchestrator import AgentOrchestrator, OrchestratorRequest
@@ -39,6 +39,7 @@ class _FakeModel:
     def __init__(self, settings: typing.Any | None = None) -> None:
         self._settings = settings or _FakeModelSettings()
         self.calls: list[ChatRequest] = []
+        self.model_name = self._settings.model_name
 
     def invoke(self, request: ChatRequest) -> ChatResponse:
         self.calls.append(request)

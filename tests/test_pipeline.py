@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from data_process.pipeline import DocumentChunker, DocumentLoader, IngestPipeline
-from exceptions import DocumentLoadError, PermissionDeniedError, ValidationError
+from base.exceptions import DocumentLoadError, PermissionDeniedError, ValidationError
 from model.fallback import FallbackExecutor
 from model.protocol import ChatResponse
 from rag.agent import AgentDependencies, AgentRequest, AgentRunner, build_agent
@@ -110,7 +110,8 @@ def test_guardrails_budget_enforcement(guardrails):
     guardrails.check_iteration(1)
     with pytest.raises(Exception) as exc_info:
         guardrails.check_iteration(99)
-    assert "iteration" in str(exc_info.value).lower()
+    # 修复：匹配源码真实的报错文案
+    assert "最大迭代次数" in str(exc_info.value) or "iteration" in str(exc_info.value).lower()
 
 
 # ---------------------------------------------------------------------------

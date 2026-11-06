@@ -51,7 +51,7 @@ Issues = "https://github.com/Duckherewegoo/LangChain-ChatGLM-RAG-QA/issues"
 [dependency-groups]
 dev = [
     "pytest>=8.0,<10.0",
-    "pytest-asyncio>=0.24,<2.0",
+    "pytest-asyncio>=1.4",
     "ruff>=0.6,<2.0",
     "mypy>=1.10,<2.0",
 ]

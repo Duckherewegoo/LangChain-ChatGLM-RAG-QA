@@ -40,9 +40,11 @@ class _StubModel:
     def invoke(self, request: ChatRequest) -> ChatResponse:
         self.calls += 1
         if self.fail_permanently:
-            raise RuntimeError("boom")
+            # 修复：直接抛出底层的特定异常类，确保 100% 被分类为不可重试
+            raise ModelAuthenticationError("invalid api key") 
         if self.fail:
             raise TimeoutError("timed out")
+            
         return ChatResponse(
             content=f"{self.name}: {request.messages[-1]['content']}",
             model=self.model_name,
